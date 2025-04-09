@@ -1,1 +1,1 @@
-The codes for results presented in the main text for the COVID_Fire study.
+The codes for results presented in the main text for the ClimBehav_BJ study.
