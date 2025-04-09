@@ -1,0 +1,195 @@
+---
+title: "Future response plot"
+format: html
+author: "Chen Yu"
+---
+# Set up packages and environment
+```{r}
+library(tidyverse)
+library(dplyr)
+library(data.table)
+library(plyr) #for additional manipulation functions and revulue function
+library(parallel) #for mclapply function
+library(gridExtra) # for multiplots
+library(ggpubr) # for multiplots and labels,ggarrange function
+library(grid)
+
+season<- function(df){
+  df$season<-4
+  df$season[df$month >= 9 & df$month <= 11]<-3
+  df$season[df$month >= 6 & df$month <= 8]<-2
+  df$season[df$month >= 3 & df$month <= 5]<-1
+  return(df)
+}
+#call for 4 cores
+cores <- 4
+```
+
+# Data preperation
+```{r}
+dir_list <- dir("/project/public/tmp_cy/respProj/")
+respProj <- mclapply(dir_list, function(n){
+  x <- fread(paste0("/project/public/tmp_cy/respProj/",n))
+  return(x)
+},mc.cores = cores) %>% data.table::rbindlist()
+
+#rbind baseline
+respProj <- rbind(respProj,data.table(
+  year = 2017,
+  month = 1:12,
+  class = c(rep(1,12),rep(2,12),rep(3,12),rep(4,12)),
+  differ = 0,
+  differ.upr = 0,
+  differ.lwr = 0
+))
+
+workLiveLabel <- c("Residential", "Park", "Transport", "Workplace")
+respProj$class <- respProj$class %>% 
+  factor() %>% 
+  revalue(c("1" = "Residential", "2" = "Park", "3" = "Transport", "4" = "Workplace"))
+
+# divide respProj into centrary data & 2018~2100 timeline data to plot
+respProj.centr <- respProj[year %in% c("Mid", "Long")]
+
+respProj.line <- respProj[year %in% c(2017:2100)]
+respProj.line <- season(respProj.line)
+respProj.line$season <- respProj.line$season %>% 
+  factor() %>%
+  revalue(c("1" = "Spring", "2" = "Summar","3" = "Autumn","4"="Winter")) %>%
+  factor(levels = c("Spring", "Summar", "Autumn", "Winter"))
+respProj.line$year <- respProj.line$year %>% as.numeric()
+
+respProj.line[,differ := mean(differ),by = c("year","season","class")] 
+respProj.line[,differ.upr := mean(differ.upr),by =c("year","season","class")]
+respProj.line[,differ.lwr := mean(differ.lwr),by =c("year","season","class")] 
+respProj.line<- respProj.line %>% distinct(year,season,class, .keep_all = T)
+#respProj.line[year == 2100]
+
+respProj.centr$year <- respProj.centr$year %>% 
+  factor() %>%
+  revalue(c("Mid" = "2046-2055", "Long" = "2090-2099")) %>%
+  factor(levels = c("2046-2055", "2090-2099"))
+classColor <- c("Residential" = "#457b9d","Park" = "#84a729","Transport" = "#C75c64","Workplace" = "#f0b57d")
+classSubColor <- c("Residential" = "#e6f1f3","Park" = "#D3e1ae","Transport" = "#eea2a4","Workplace" = "#f8e8c1")
+
+
+```
+#  plot future response change by month during mid|long 21st centrary
+```{r}
+P1 <- ggplot(respProj.centr[str_detect(class,"Residential|Workplace")==1], aes(month, differ)) +
+  geom_col(aes(fill = year,colour = year),position = "dodge",linewidth = 0.5) +
+  geom_errorbar(aes(ymax = differ.upr,ymin = differ.lwr,colour = year),position = "dodge",linewidth = 0.5) +
+  facet_wrap(~class, nrow = 1) +
+  ylab("Percentage change in visitation") +
+  scale_fill_manual(values = c("2046-2055"="#D3e1ae", "2090-2099"="#eea2a4")) +
+  scale_colour_manual(values = c("2046-2055"="#84a729", "2090-2099"="#C75c64")) +
+  scale_x_continuous(breaks = c(1:12)) +
+  theme_bw()+
+  theme(
+        # legend.position = "none",
+        axis.title.x = element_text(size=7, angle=0, vjust=1.1),
+        axis.title.y = element_text(size=7, angle=90, vjust=-0),
+        axis.text.y = element_text(size=6, angle=0),
+        axis.text.x = element_text(size=6),
+        legend.text = element_text(size=6),
+        legend.title = element_text(size=7),
+        legend.key.size = unit(5, "mm"),
+        strip.text = element_text(size = 7,margin = margin(t = 2, b = 2)))
+P2 <- ggplot(respProj.centr[str_detect(class,"Park|Transport")==1], aes(month, differ)) +
+  geom_col(aes(fill = year,colour = year),position = "dodge",linewidth = 0.5) +
+  geom_errorbar(aes(ymax = differ.upr,ymin = differ.lwr,colour = year),position = "dodge",linewidth = 0.5) +
+  facet_wrap(~class, nrow = 1) +
+  ylab("Percentage change in visitation") +
+  scale_fill_manual(values = c("2046-2055"="#D3e1ae", "2090-2099"="#eea2a4")) +
+  scale_colour_manual(values = c("2046-2055"="#84a729", "2090-2099"="#C75c64")) +
+  scale_x_continuous(breaks = c(1:12)) +
+  theme_bw()+
+  theme(
+        # legend.position = "none",
+        axis.title.x = element_text(size=7, angle=0, vjust=1.1),
+        axis.title.y = element_text(size=7, angle=90, vjust=-0),
+        axis.text.y = element_text(size=6, angle=0),
+        axis.text.x = element_text(size=6),
+        legend.text = element_text(size=6),
+        legend.title = element_text(size=7),
+        legend.key.size = unit(5, "mm"),
+        strip.text = element_text(size = 7,margin = margin(t = 2, b = 2)))
+grid.arrange(P1,P2,nrow = 2)
+```
+#  plot future response change in Summar or Winter from 2018-2100(baseline:2017)
+```{r}
+p1 <- ggplot(respProj.line[str_detect(season,"Winter")==1 & str_detect(class,"Residential|Workplace")==1], aes(year, differ)) +
+  geom_ribbon(aes(ymin = differ.lwr,ymax = differ.upr, fill = season),alpha = 1) +
+  geom_line(aes(colour = season),linewidth = 0.5) +
+  geom_ribbon(data = respProj.line[str_detect(season,"Summar")==1 & str_detect(class,"Residential|Workplace")==1],aes(ymin = differ.lwr,ymax = differ.upr, fill = season),alpha = 0.7) +
+  geom_line(data=respProj.line[str_detect(season,"Summar")==1 & str_detect(class,"Residential|Workplace")==1],aes(colour = season)) +
+  facet_wrap(~class, nrow = 1) +
+  ylab("Percentage change in visitation") +
+  scale_fill_manual(values = c("Winter"="#e6f1f3", "Summar"="#F6D0D1")) +
+  scale_colour_manual(values = c("Winter"="#457b9d", "Summar"="#C75c64")) +
+  scale_x_continuous(breaks = seq(from = 2020,to = 2100,20)) +
+  scale_y_continuous(limits = c(-5,5)) +
+  theme_bw()+
+  theme(
+        legend.position = "none",
+        axis.title.x = element_text(size=7, angle=0, vjust=1.1),
+        axis.title.y = element_text(size=7, angle=90, vjust=-0),
+        axis.text.y = element_text(size=6, angle=0),
+        axis.text.x = element_text(size=6),
+        legend.text = element_text(size=6),
+        legend.title = element_text(size=7),
+        legend.key.size = unit(5, "mm"),
+        strip.text = element_text(size = 7,margin = margin(t = 2, b = 2)))
+
+p2 <- ggplot(respProj.line[str_detect(season,"Winter")==1 & str_detect(class,"Park|Transport")==1], aes(year, differ)) +
+  geom_ribbon(aes(ymin = differ.lwr,ymax = differ.upr, fill = season),alpha = 1) +
+  geom_line(aes(colour = season),linewidth = 0.5) +
+  geom_ribbon(data = respProj.line[str_detect(season,"Summar")==1 & str_detect(class,"Park|Transport")==1],aes(ymin = differ.lwr,ymax = differ.upr, fill = season),alpha = 0.7) +
+  geom_line(data=respProj.line[str_detect(season,"Summar")==1 & str_detect(class,"Park|Transport")==1],aes(colour = season)) +
+  facet_wrap(~class, nrow = 1) +
+  ylab("Percentage change in visitation") +
+  scale_fill_manual(values = c("Winter"="#e6f1f3", "Summar"="#F6D0D1")) +
+  scale_colour_manual(values = c("Winter"="#457b9d", "Summar"="#C75c64")) +
+  scale_x_continuous(breaks = seq(from = 2020,to = 2100,20)) +
+  scale_y_continuous(limits = c(-20,20)) +
+  theme_bw()+
+  theme(
+        legend.position = "none",
+        axis.title.x = element_text(size=7, angle=0, vjust=1.1),
+        axis.title.y = element_text(size=7, angle=90, vjust=-0),
+        axis.text.y = element_text(size=6, angle=0),
+        axis.text.x = element_text(size=6),
+        legend.text = element_text(size=6),
+        legend.title = element_text(size=7),
+        legend.key.size = unit(5, "mm"),
+        strip.text = element_text(size = 7,margin = margin(t = 2, b = 2)))
+
+grid.arrange(p1,p2,nrow = 2)
+```
+#plot
+```{r}
+p <- ggarrange(P1,p1,P2,p2,nrow = 2,ncol = 2,labels = c("a","c","b","d"),font.label = list(size = 9))
+
+# setEPS() with legend
+cairo_ps(file = "~/ClimBehav_bj/results/plots/figure4.eps",width = 7.08,height = 4.72)
+pushViewport(viewport(layout = grid.layout(2,2)))
+print(P1, vp = viewport(layout.pos.row = 1,layout.pos.col = 1))
+print(P2, vp = viewport(layout.pos.row = 2,layout.pos.col = 1))
+print(p1, vp = viewport(layout.pos.row = 1,layout.pos.col = 2))
+print(p2, vp = viewport(layout.pos.row = 2,layout.pos.col = 2))
+# print(ggdraw(p2), vp = viewport(layout.pos.row = 2,layout.pos.col = 1))
+dev.off()
+# save svg without legend
+svg(file = "~/ClimBehav_bj/results/plots/figure4.svg",width = 7.08,height = 4.72)
+pushViewport(viewport(layout = grid.layout(2,2)))
+print(P1, vp = viewport(layout.pos.row = 1,layout.pos.col = 1))
+print(P2, vp = viewport(layout.pos.row = 2,layout.pos.col = 1))
+print(p1, vp = viewport(layout.pos.row = 1,layout.pos.col = 2))
+print(p2, vp = viewport(layout.pos.row = 2,layout.pos.col = 2))
+# print(ggdraw(p2), vp = viewport(layout.pos.row = 2,layout.pos.col = 1))
+dev.off()
+
+ggsave("~/ClimBehav_bj/results/plots/figure4.eps",plot = p, device = "eps", width =180, height =135,units = "mm")
+ggsave("~/ClimBehav_bj/results/plots/figure4.pdf",plot = p, device = "pdf", width =180, height =120,units = "mm")
+```
+

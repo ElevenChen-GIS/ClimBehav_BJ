@@ -1,0 +1,2000 @@
+---
+title: "异质性探究"
+author: "Yu Chen"
+format: html
+editor: source
+---
+
+## Set up packages and environment
+
+```{r}
+#| label: load-packages
+#| warning: false
+
+library(tidyverse)
+library(terra)       #处理栅格数据
+library(magrittr)    #提供管道操作
+library(lubridate)    #提供时间有关函数
+library(data.table)
+library(fixest)   #提供feols函数
+library(lfe)  #提供felm函数
+library(ggExtra) # for marginal histograms
+library(plyr) #for additional manipulation functions
+library(gridExtra) # for multiplots
+# library(zoo) #提供滑动平均函数
+library(stargazer)
+
+source("~/ClimBehav_bj/results/scripts/binned_plot_function.R")
+source("~/ClimBehav_bj/results/scripts/change_plot.R")
+load("~/ClimBehav_bj/results/data/raw/01_AOI/11-北京市-aoi.Rdata")
+fangjia <- fread(file = "~/ClimBehav_bj/results/data/processed/income.csv")
+point_urban <- fread(file = "~/ClimBehav_bj/results/data/processed/heteData.csv")
+
+
+season<- function(df){
+  df$season<-4
+  df$season[df$month >= 9 & df$month <= 11]<-3
+  df$season[df$month >= 6 & df$month <= 8]<-2
+  df$season[df$month >= 3 & df$month <= 5]<-1
+  return(df)
+}
+threshold <- function(dt, a){
+  visit.stat <- dt %>% group_by(id) %>% dplyr::summarise(daily_visit_num = sum(visits / 365, na.rm = T))
+  base_select <- filter(visit.stat, daily_visit_num >= a)
+  dt <- dt %>%
+    dplyr::filter(id %in% base_select$id)
+  return(dt)
+}
+```
+
+## Data preparation
+
+(1) filter out large parks with visitors greater than 1000 people per day;
+(2) filter out the daytime 、compute and select the variables needed
+
+```{r}
+#| label: Data preparation
+#| eval: true
+#读取climate_mp数据()
+df <- fread(file = "~/ClimBehav_bj/results/data/processed/climate_mp.csv.gz", nThread = 14)
+
+#df数据集还原
+dig = 3
+cutt_levels <- c("(-10,0]", "(0,5]", "(5,10]", "(10,15]", "(15,20]", "(20,25]", "(25,30]", "(30,35]","(35,40]")
+df[,':='(
+  date = make_date(year, month, day),
+  t = t / 10 ^ dig,
+  sp = sp / 10^dig,   #将单位换算成hPa
+  tp = tp * 10^3,    #将单位换算成mm
+  blh = blh / 10^dig, 
+  tcc = tcc / 10^3,     #将单位换算成%   
+  wind = wind / 10^dig,
+  rhum = rhum / 10^dig,
+  visits = as.double(visits)
+)][, ':='(
+    log_visit = log(visits + 1),
+    cutt = factor(cut(t, breaks = c(-10, seq(from = 0, to = 40, by = 5))), levels = cutt_levels))]
+
+#剔除重复aoi
+aoi <- aoi %>% 
+  as_tibble() %>% 
+  separate(col = "location", into = c("lon", "lat"), sep = ",", convert = T) %>% 
+  distinct(id, .keep_all = T)                          #剔除重复的id,剔除后为23674条观测
+
+```
+
+大类分类&小类分类，对行为进行分析时运用到的分类
+
+```{r}
+###### 1.classification ######
+##############################
+
+df_classify<- aoi %>% as.data.table()
+#######1.居家行为#########
+df_classify[str_detect(type, "^120302") & str_detect(name, "(建设中)|(装修中)") == 0, ':='(class = 1, subclass = 1)] #住宅小区
+
+#######2.公园访问#########
+df_classify[str_detect(type, "^1101(00|01|05|06)") & str_detect(name, "(建设中)|(装修中)") == 0, ':='(class = 2, subclass = 2)] #公园广场和内部设施
+df_classify[str_detect(type, "^1101(02|03|04)") & str_detect(name, "(建设中)|(装修中)") == 0, ':='(class = 2, subclass = 3)] #主题公园
+df_classify[str_detect(type, "^1102(00|01|02|03|04|05|06|07|09)") & str_detect(name, "(建设中)|(装修中)") == 0, ':='(class = 2, subclass = 4)] #风景名胜
+
+####### 3.Transport #########
+df_classify[str_detect(type, "^(150104|150200|1504)") & str_detect(name, "(建设中)|(装修中)") == 0, ':='(class = 3, subclass = 5)] #机场、火车站、长途车站
+df_classify[str_detect(type, "^1503(01|02|03)|151200") & str_detect(name, "(建设中)|(装修中)") == 0, ':='(class = 3, subclass = 6)] #渡口、港口
+
+#######4.Workplace#########
+df_classify[str_detect(type, "^1704") & str_detect(name, "(建设中)|(装修中)") == 0, ':='(class = 4, subclass = 7)] #农林牧渔基地
+df_classify[str_detect(type, "^1202|^17(01|02)") & str_detect(name, "(建设中)|(装修中)") == 0, ':='(class = 4, subclass = 8)] #公司企业、写字楼
+df_classify[str_detect(type, "^1703|^1201") & str_detect(name, "(建设中)|(装修中)") == 0, ':='(class = 4, subclass = 9)] #工厂，产业园
+df_classify[str_detect(name, "(建设中)|(装修中)"), ':='(class = 4, subclass = 10)] #建筑工地,需要放在所有分类的最后
+df <- inner_join(df_classify, df, by = "id", relationship = "many-to-many")
+rm(df_classify)
+
+df <- df %>% threshold(50) %>%
+  dplyr::filter(hour >= 7 & hour <= 22)
+gc()
+#Heterogeneity Data
+point_urban <- point_urban[, .(id, Urban = GHS_SMOD_E2015_GLOBE_R2023A_54009_1000_V1_0_R5_C28)]
+df <- left_join(df, point_urban, by = "id")
+df[Urban == 30, urban := 1]
+df[is.na(urban) == 1, urban := 0]
+# df$urban <- as.factor(df$urban)
+
+df <- left_join(df, fangjia, by = "id")
+fangjia_thre <- median(df$avg_unit_price)
+df[avg_unit_price >= fangjia_thre, income := 1]
+df[avg_unit_price < fangjia_thre, income := 0]
+
+gc()
+```
+
+#Data analysis
+
+```{r}
+#rate
+heter_stat <- df %>% group_by(id) %>% dplyr::summarise(urban = mean(urban), income = mean(income), class = mean(class), subclass = mean(subclass))
+heter_stat$urban <- heter_stat$urban %>% as.factor()
+heter_stat$income <- heter_stat$income %>% as.factor()
+p <- ggplot(heter_stat, aes(x = subclass)) +
+  geom_bar(aes(fill = urban), position = "fill")
+p <- ggplot(heter_stat, aes(x = subclass)) +
+  geom_bar(aes(fill = income), position = "fill")
+```
+
+```{r}
+#分类定义
+workLiveLabel <- c("Residential", "Park", "Transport", "Workplace")
+df$class <- df$class %>% 
+  factor() %>% 
+  revalue(c("1" = "Residential", "2" = "Park", "3" = "Transport", "4" = "Workplace")) %>% 
+  factor(labels = c("Residential", "Park", "Transport", "Workplace"))
+classColor <- c("Residential" = "#457b9d","Park" = "#84a729","Transport" = "#C75c64","Workplace" = "#f0b57d")
+```
+
+## All sample regression
+
+## Heterogeneity
+
+```{r}
+#| label: indoor or outdoor
+#| warning: false
+#| eval: false
+
+df_work$outdoor <- 0
+df_work$outdoor[df_work$type %in% unique(str_subset(df_work$type, "^1201|^17(03|04)"))] <- 1
+df_work[outdoor == 1, .N]/df_work[, .N]
+work.p <- NULL
+work_coef <- NULL
+
+for(i in 0:1){
+  dta <- df_work[outdoor == i, with = T]
+  dta <- within(dta , cutt <- relevel(cutt, ref = "(10,15]"))
+  reg <- felm(log_visit ~ cutt + tp + wind + rhum + sp + tcc + holidays +aqi        #   covariates |
+                        |id + hour + month + dow
+                        | 0 |type,
+                      data = dta, na.action="na.omit")
+
+  work.p[[i+1]] <- binned.plot(felm.est = reg,
+                  plotvar = "cutt",
+                  breaks = 5,
+                  omit = c(10, 15),
+                  xlimit = c(-10,40),
+                  ylimit = c(-15,10),
+                  panel = i,
+                  xlabel = "Workplace",
+                  ylabel = "Percentage change in visits (%)")
+  work_coef[[i+1]] <- felmCoeff(reg,var = "cutt", omit = c(10, 15)) %>% 
+    select(coef, se, t, p, star, range, semin, semax)
+}
+work.p
+work_coef
+
+
+df_recre$outdoor <- 0
+df_recre$outdoor[df_recre$type %in% unique(str_subset(df_recre$type, "^0610|^0805"))] <- 1
+df_recre[outdoor == 1, .N]/df_recre[, .N]
+recre.p <- NULL
+recre_coef <- NULL
+
+
+for(i in 0:1){
+  dta <- df_recre[outdoor == i, with = T]
+  dta <- within(dta , cutt <- relevel(cutt, ref = "(10,15]"))
+  reg <- felm(log_visit ~ cutt + tp + wind + rhum + sp + tcc + holidays +aqi        #   covariates |
+                        |id + hour + month + dow
+                        | 0 |type,
+                      data = dta, na.action="na.omit")
+
+  recre.p[[i+1]] <- binned.plot(felm.est = reg,
+                  plotvar = "cutt",
+                  breaks = 5,
+                  omit = c(10, 15),
+                  xlimit = c(-10,40),
+                  ylimit = c(-15,10),
+                  panel = i,
+                  xlabel = "recreation",
+                  ylabel = "Percentage change in visits (%)")
+  recre_coef[[i+1]] <- felmCoeff(reg,var = "cutt", omit = c(10, 15)) %>% 
+    select(coef, se, t, p, star, range, semin, semax)
+}
+recre.p
+recre_coef
+
+
+
+
+df_park$outdoor <- 0
+df_park$outdoor[df_park$type %in% unique(str_subset(df_park$type, "^0801(05|06|08|09|15|16|17)|^0802|^1101|^1102(00|01|02|03)"))] <- 1
+df_park[outdoor == 1, .N]/df_park[, .N]
+park.p <- NULL
+park_coef <- NULL
+
+for(i in 0:1){
+  dta <- df_park[outdoor == i, with = T]
+  dta <- within(dta , cutt <- relevel(cutt, ref = "(20,25]"))
+  reg <- felm(log_visit ~ cutt + tp + wind + rhum + sp + tcc + holidays +aqi        #   covariates |
+                        |id + hour + month + dow
+                        | 0 |type,
+                      data = dta, na.action="na.omit")
+
+  park.p[[i+1]] <- binned.plot(felm.est = reg,
+                  plotvar = "cutt",
+                  breaks = 5,
+                  omit = c(20, 25),
+                  xlimit = c(-10,40),
+                  ylimit = c(-15,10),
+                  panel = i,
+                  xlabel = "park",
+                  ylabel = "Percentage change in visits (%)")
+  park_coef[[i+1]] <- felmCoeff(reg,var = "cutt", omit = c(20, 25)) %>% 
+    select(coef, se, t, p, star, range, semin, semax)
+}
+park.p
+park_coef
+
+
+df_shop$outdoor <- 0
+df_shop$outdoor[df_shop$type %in% unique(str_subset(df_shop$type, "^06(05|06|07)|^0719(01|02)"))] <- 1
+df_shop[outdoor == 1, .N]/df_shop[, .N]
+shop.p <- NULL
+shop_coef <- NULL
+
+for(i in 0:1){
+  dta <- df_shop[outdoor == i, with = T]
+  dta <- within(dta , cutt <- relevel(cutt, ref = "(10,15]"))
+  reg <- felm(log_visit ~ cutt + tp + wind + rhum + sp + tcc + holidays +aqi        #   covariates |
+                        |id + hour + month + dow
+                        | 0 |type,
+                      data = dta, na.action="na.omit")
+
+  shop.p[[i+1]] <- binned.plot(felm.est = reg,
+                  plotvar = "cutt",
+                  breaks = 5,
+                  omit = c(10, 15),
+                  xlimit = c(-10,40),
+                  ylimit = c(-15,10),
+                  panel = i,
+                  xlabel = "shopping",
+                  ylabel = "Percentage change in visits (%)")
+  shop_coef[[i+1]] <- felmCoeff(reg,var = "cutt", omit = c(20, 25)) %>% 
+    select(coef, se, t, p, star, range, semin, semax)
+}
+shop.p
+shop_coef
+
+df_edu$outdoor <- 0
+df_edu$outdoor[df_edu$type %in% unique(str_subset(df_shop$type, "141500"))] <- 1
+df_edu[outdoor == 1, .N]/df_edu[, .N]
+# edu.p <- NULL
+# edu_coef <- NULL
+# 
+# for(i in 0:1){
+#   dta <- df_edu[outdoor == i, with = T]
+#   dta <- within(dta , cutt <- relevel(cutt, ref = "(10,15]"))
+#   reg <- felm(log_visit ~ cutt + tp + wind + rhum + sp + tcc + holidays        #   covariates |
+#                         |id + hour + month + dow
+#                         | 0 |type,
+#                       data = dta, na.action="na.omit")
+# 
+#   edu.p[[i+1]] <- binned.plot(felm.est = reg,
+#                   plotvar = "cutt",
+#                   breaks = 5,
+#                   omit = c(10, 15),
+#                   xlimit = c(-10,40),
+#                   ylimit = c(-15,10),
+#                   panel = i,
+#                   xlabel = "edu",
+#                   ylabel = "Percentage change in visits (%)")
+#   edu_coef[[i+1]] <- felmCoeff(reg,var = "cutt", omit = c(20, 25)) %>% 
+#     select(coef, se, t, p, star, range, semin, semax)
+# }
+# edu.p
+# edu_coef
+
+
+
+df$outdoor <- 1
+df$outdoor[df$type %in% unique(str_subset(df$type, "^1203|^1001"))] <- 0
+# df[outdoor == 1, .N]/df[, .N]
+df.p <- NULL
+df_coef <- NULL
+
+for(i in 0:1){
+  dta <- df[outdoor == i, with = T]
+  dta <- within(dta , cutt <- relevel(cutt, ref = "(20,25]"))
+  reg <- felm(log_visit ~ cutt + tp + wind + rhum + sp + tcc + holidays +aqi        #   covariates |
+                        |id + hour + month + dow
+                        | 0 |type,
+                      data = dta, na.action="na.omit")
+
+  df.p[[i+1]] <- binned.plot(felm.est = reg,
+                  plotvar = "cutt",
+                  breaks = 5,
+                  omit = c(20, 25),
+                  xlimit = c(-10,40),
+                  ylimit = c(-15,10),
+                  panel = i,
+                  xlabel = "beijing",
+                  ylabel = "Percentage change in visits (%)")
+  df_coef[[i+1]] <- felmCoeff(reg,var = "cutt", omit = c(10, 15)) %>% 
+    select(coef, se, t, p, star, range, semin, semax)
+}
+df.p
+df_coef
+
+```
+
+#### Residential
+
+```{r}
+#| label: residential heterogeneity
+## 2 Spatial: By  
+# Resident (^1203)+ traveller(^1001)
+
+# df_resid$cate<-1
+# df_resid$cate[df_resid$type %in% c("100100")]<-2
+
+# reg_tem_type<-NULL
+# coef <- NULL
+# tem <- NULL
+# resid_cate.p <- NULL
+# resid_cate_coef <- NULL
+# 
+# for(i in 1:2){
+#   dta <- df_resid[cate == i, with = T]
+#   dta <- within(dta , cutt <- relevel(cutt, ref = "(10,15]"))
+#   reg <- felm(log_visit ~ cutt + tp + wind + rhum + sp + tcc + holidays +aqi        #   covariates |
+#                         |id + hour + month + dow
+#                         | 0 |type,
+#                       data = dta, na.action="na.omit")
+# 
+#   resid_cate.p[[i]] <- binned.plot(felm.est = reg,
+#                   plotvar = "cutt",
+#                   breaks = 5,
+#                   omit = c(10, 15),
+#                   xlimit = c(-10,40),
+#                   ylimit = c(-10,10),
+#                   panel = i,
+#                   group = "Residential",
+#                   xlabel = "work",
+#                   ylabel = "Percentage change in visits (%)")
+#   resid_cate_coef[[i]] <- felmCoeff(reg,var = "cutt", omit = c(10, 15)) %>% 
+#     select(coef, se, t, p, star, range, semin, semax)
+# }
+# resid_cate.p
+# resid_cate_coef
+
+## 3 Temoral: holiday
+resid_holiday.p <- NULL
+resid_holiday_coef <- NULL
+
+for(i in 0:1){
+  dta <- df_resid[holidays == i, with = T]
+  dta <- within(dta , cutt <- relevel(cutt, ref = "(20,25]"))
+  reg <- felm(log_visit ~ cutt + tp + wind + rhum + sp + tcc +aqi        #   covariates |
+                        |id + hour + month + dow
+                        | 0 |id,
+                      data = dta, na.action="na.omit")
+
+  resid_holiday.p[[i+1]] <- binned.plot(felm.est = reg,
+                  plotvar = "cutt",
+                  breaks = 5,
+                  omit = c(20, 25),
+                  xlimit = c(-10,40),
+                  ylimit = c(-30,10),
+                  panel = i,
+                  group = "Residential",
+                  xlabel = "resid-holiday",
+                  ylabel = "Percentage change in visits (%)")
+  resid_holiday_coef[[i+1]] <- felmCoeff(reg,var = "cutt", omit = c(20, 25)) %>% 
+    select(coef, se, t, p, star, xmin, semin, semax)
+}
+resid_holiday.p
+resid_holiday_coef
+resid_holiday_coef[[1]]<- resid_holiday_coef[[1]] %>% 
+  mutate(holiday = 0)
+resid_holiday_coef[[2]]<- resid_holiday_coef[[2]] %>% 
+  mutate(holiday = 1)
+high_resid_holiday <- rbind(resid_holiday_coef[[1]], resid_holiday_coef[[2]]) %>% 
+  filter(xmin == 35)
+high_resid_holiday$holiday <- as.factor(high_resid_holiday$holiday)
+high_resid_holiday %>% 
+  ggplot()+
+    geom_errorbar(mapping=aes(x=holiday,ymin=semin,ymax=semax),width=0.3,color="black",size=1.5) +
+    geom_bar(mapping=aes(x=holiday,y=coef,fill=holiday), size=1.5,position="dodge", stat="identity",width=0.6) +
+  ylab("Margin effect of >30℃") +
+  theme_bw()
+
+## 3 Temoral: daytime
+df_park$daytime<-0
+# df_park$cate[df_park$type %in% c("080200", "080201","080202")]<-3
+df_park$daytime[df_park$hour >= 6 & df_park$hour <= 18]<-1
+
+# reg_tem_type<-NULL
+# coef <- NULL
+# tem <- NULL
+resid_daytime.p <- NULL
+resid_daytime_coef <- NULL
+
+for(i in 0:1){
+  dta <- df_resid[daytime == i, with = T]
+  dta <- within(dta , cutt <- relevel(cutt, ref = "(20,25]"))
+  reg <- felm(log_visit ~ cutt + tp + wind + rhum + sp + tcc + holidays +aqi        #   covariates |
+                        |id + hour + month + dow
+                        | 0 |type,
+                      data = dta, na.action="na.omit")
+
+  resid_daytime.p[[i+1]] <- binned.plot(felm.est = reg,
+                  plotvar = "cutt",
+                  breaks = 5,
+                  omit = c(20, 25),
+                  xlimit = c(-10,40),
+                  ylimit = c(-30,10),
+                  panel = i,
+                  xlabel = "park-daytime",
+                  ylabel = "Percentage change in visits (%)")
+  resid_daytime_coef[[i+1]] <- felmCoeff(reg,var = "cutt", omit = c(20, 25)) %>% 
+    select(coef, se, t, p, star, range, semin, semax) %>% 
+    mutate()
+}
+resid_daytime.p
+# resid_daytime_coef
+
+## 3 Temoral: season
+
+df_resid <- season(df_resid)
+
+# reg_tem_type<-NULL
+# coef <- NULL
+# tem <- NULL
+resid_season.p <- NULL
+resid_season_coef <- NULL
+
+for(i in 1:4){
+  dta <- df_resid[season == i, with = T]
+  dta <- within(dta , cutt <- relevel(cutt, ref = "(20,25]"))
+  reg <- felm(log_visit ~ cutt + tp + wind + rhum + sp + tcc + holidays +aqi        #   covariates |
+                        |id + hour + month + dow
+                        | 0 |id,
+                      data = dta, na.action="na.omit")
+
+  resid_season.p[[i]] <- binned.plot(felm.est = reg,
+                  plotvar = "cutt",
+                  breaks = 5,
+                  omit = c(20, 25),
+                  xlimit = c(-10,40),
+                  ylimit = c(-30,10),
+                  panel = i,
+                  group = "resid",
+                  xlabel = "resid-season",
+                  ylabel = "Percentage change in visits (%)")
+  resid_season_coef[[i]] <- felmCoeff(reg,var = "cutt", omit = c(20, 25)) %>% 
+    select(coef, se, t, p, star, xmin, semin, semax) %>% 
+    mutate(season = i)
+}
+resid_season.p
+resid_season_coef
+high_resid_season <- rbind(resid_season_coef[[1]], resid_season_coef[[2]], resid_season_coef[[3]], resid_season_coef[[4]]) %>% 
+  filter(xmin == 35)
+high_resid_season$season <- as.factor(high_resid_season$season)
+high_resid_season %>% 
+  ggplot()+
+    geom_errorbar(mapping=aes(x=season,ymin=semin,ymax=semax),width=0.3,color="black",size=1.5) +
+    geom_bar(mapping=aes(x=season,y=coef,fill=season), size=1.5,position="dodge", stat="identity",width=0.6) +
+  ylab("Margin effect of >30℃") +
+  theme_bw()
+
+#Urban/Rural 异质性探究 Residential
+resid_urban.p <- NULL
+resid_urban_coef <- NULL
+for(i in 0:1){
+  dta <- df_resid[urban == i, with = T]
+  dta <- within(dta , cutt <- relevel(cutt, ref = "(20,25]"))
+  reg <- felm(log_visit ~ cutt + tp + wind + rhum + sp + tcc + holidays +aqi        #   covariates |
+                        |id + hour + month + dow
+                        | 0 |type,
+                      data = dta, na.action="na.omit")
+
+  resid_urban.p[[i+1]] <- binned.plot(felm.est = reg,
+                  plotvar = "cutt",
+                  breaks = 5,
+                  omit = c(20, 25),
+                  xlimit = c(-10,40),
+                  ylimit = c(-30,10),
+                  panel = i,
+                  group = "resid",
+                  xlabel = "urban",
+                  ylabel = "Percentage change in visits (%)")
+  resid_urban_coef[[i+1]] <- felmCoeff(reg,var = "cutt", omit = c(20, 25)) %>% 
+    select(coef, se, t, p, star,xmin , range, semin, semax) %>% 
+    mutate(urban = i)
+}
+resid_urban.p
+high_resid_urban <- rbind(resid_urban_coef[[1]], resid_urban_coef[[2]]) %>% 
+  filter(xmin == 35)
+high_resid_urban$urban <- as.factor(high_resid_urban$urban)
+high_resid_urban %>% 
+  ggplot()+
+    geom_errorbar(mapping=aes(x=urban,ymin=semin,ymax=semax),width=0.3,color="black",size=1.5) +
+    geom_bar(mapping=aes(x=urban,y=coef,fill=urban), size=1.5,position="dodge", stat="identity",width=0.6) +
+  ylab("Margin effect of >30℃") +
+  theme_bw()
+grid.arrange(resid_urban.p[[1]], resid_urban.p[[2]], ncol = 2)
+
+resid_season.p
+resid_season_coef
+high_resid_season <- rbind(resid_season_coef[[1]], resid_season_coef[[2]], resid_season_coef[[3]], resid_season_coef[[4]]) %>% 
+  filter(xmin == 35)
+high_resid_season$season <- as.factor(high_resid_season$season)
+high_resid_season %>% 
+  ggplot()+
+    geom_errorbar(mapping=aes(x=season,ymin=semin,ymax=semax),width=0.3,color="black",size=1.5) +
+    geom_bar(mapping=aes(x=season,y=coef,fill=season), size=1.5,position="dodge", stat="identity",width=0.6) +
+  ylab("Margin effect of >30℃") +
+  theme_bw()
+
+#Income 异质性探究 Residential
+resid_income.p <- NULL
+resid_income_coef <- NULL
+for(i in 0:1){
+  dta <- df_resid[income == i, with = T]
+  dta <- within(dta , cutt <- relevel(cutt, ref = "(20,25]"))
+  reg <- felm(log_visit ~ cutt + tp + wind + rhum + sp + tcc + holidays +aqi        #   covariates |
+                        |id + hour + month + dow
+                        | 0 |type,
+                      data = dta, na.action="na.omit")
+
+  resid_income.p[[i+1]] <- binned.plot(felm.est = reg,
+                  plotvar = "cutt",
+                  breaks = 5,
+                  omit = c(20, 25),
+                  xlimit = c(-10,40),
+                  ylimit = c(-30,10),
+                  panel = i,
+                  group = "resid",
+                  xlabel = "income",
+                  ylabel = "Percentage change in visits (%)")
+  resid_income_coef[[i+1]] <- felmCoeff(reg,var = "cutt", omit = c(20, 25)) %>% 
+    select(coef, se, t, p, star,xmin , range, semin, semax) %>% 
+    mutate(income = i)
+}
+resid_income.p
+high_resid_income <- rbind(resid_income_coef[[1]], resid_income_coef[[2]]) %>% 
+  filter(xmin == 35)
+high_resid_income$income <- as.factor(high_resid_income$income)
+high_resid_income %>% 
+  ggplot()+
+    geom_errorbar(mapping=aes(x=income,ymin=semin,ymax=semax),width=0.3,color="black",size=1.5) +
+    geom_bar(mapping=aes(x=income,y=coef,fill=income), size=1.5,position="dodge", stat="identity",width=0.6) +
+  ylab("Margin effect of >30℃") +
+  theme_bw()
+grid.arrange(resid_income.p[[1]], resid_income.p[[2]], ncol = 2)
+```
+
+#### Workplace
+
+```{r}
+#| label: work heterogeneity
+## 2 Spatial: By work functions 
+# Factory/industrial park (120100;170300)+ 农林牧渔基地 (1704)
+
+# df_work$cate<-2
+# # df_park$cate[df_park$type %in% c("080200", "080201","080202")]<-3
+# df_work$cate[df_work$type %in% c("120100", "170300")]<-1
+
+# reg_tem_type<-NULL
+# coef <- NULL
+# tem <- NULL
+work_cate.p <- NULL
+work_cate_coef <- NULL
+
+for(i in 6:9){
+  dta <- df[subclass == i, with = T]
+  dta <- within(dta , cutt <- relevel(cutt, ref = "(20,25]"))
+  reg <- felm(log_visit ~ cutt + tp + wind + rhum + sp + tcc + holidays +aqi        #   covariates |
+                        |id + hour + month + dow
+                        | 0 |type,
+                      data = dta, na.action="na.omit")
+
+  work_cate.p[[i-5]] <- binned.plot(felm.est = reg,
+                  plotvar = "cutt",
+                  breaks = 5,
+                  omit = c(20, 25),
+                  xlimit = c(-10,40),
+                  ylimit = c(-30,10),
+                  panel = i,
+                  group = "Workplaces",
+                  xlabel = "Workplace",
+                  ylabel = "Percentage change in visits (%)")
+  work_cate_coef[[i-5]] <- felmCoeff(reg,var = "cutt", omit = c(20, 25)) %>% 
+    select(coef, se, t, p, star, range, semin, semax)
+}
+work_cate.p
+work_cate_coef
+
+
+## 3 Temoral: holiday
+
+work_holiday.p <- NULL
+work_holiday_coef <- NULL
+
+for(i in 0:1){
+  dta <- df_work[holidays == i, with = T]
+  dta <- within(dta , cutt <- relevel(cutt, ref = "(20,25]"))
+  reg <- felm(log_visit ~ cutt + tp + wind + rhum + sp + tcc +aqi        #   covariates |
+                        |id + hour + month + dow
+                        | 0 |type,
+                      data = dta, na.action="na.omit")
+
+  work_holiday.p[[i+1]] <- binned.plot(felm.est = reg,
+                  plotvar = "cutt",
+                  breaks = 5,
+                  omit = c(20, 25),
+                  xlimit = c(-10,40),
+                  ylimit = c(-30,10),
+                  panel = i,
+                  group = "Workplaces",
+                  xlabel = "Workplace",
+                  ylabel = "Percentage change in visits (%)")
+  work_holiday_coef[[i+1]] <- felmCoeff(reg,var = "cutt", omit = c(20, 25)) %>% 
+    select(coef, se, t, p, star, xmin, semin, semax) %>% 
+    mutate(holiday = i)
+}
+work_holiday.p
+work_holiday_coef
+high_work_holiday <- rbind(work_holiday_coef[[1]], work_holiday_coef[[2]]) %>% 
+  filter(xmin == 35)
+high_work_holiday$holiday <- as.factor(high_work_holiday$holiday)
+high_work_holiday %>% 
+  ggplot()+
+    geom_errorbar(mapping=aes(x=holiday,ymin=semin,ymax=semax),width=0.3,color="black",size=1.5) +
+    geom_bar(mapping=aes(x=holiday,y=coef,fill=holiday), size=1.5,position="dodge", stat="identity",width=0.6) +
+  ylab("Margin effect of >30℃") +
+  theme_bw()
+
+## 3 Temoral: daytime
+df_work$worktime<-0
+# df_park$cate[df_park$type %in% c("080200", "080201","080202")]<-3
+df_work$worktime[df_work$hour >= 8 & df_work$hour <= 18 & df_work$holiday == 0]<-1
+
+# reg_tem_type<-NULL
+# coef <- NULL
+# tem <- NULL
+work_worktime.p <- NULL
+work_worktime_coef <- NULL
+
+for(i in 0:1){
+  dta <- df_work[worktime == i, with = T]
+  dta <- within(dta , cutt <- relevel(cutt, ref = "(20,25]"))
+  reg <- felm(log_visit ~ cutt + tp + wind + rhum + sp + tcc +aqi        #   covariates |
+                        |id + hour + month + dow
+                        | 0 |type,
+                      data = dta, na.action="na.omit")
+
+  work_worktime.p[[i+1]] <- binned.plot(felm.est = reg,
+                  plotvar = "cutt",
+                  breaks = 5,
+                  omit = c(20, 25),
+                  xlimit = c(-10,40),
+                  ylimit = c(-30,10),
+                  panel = i,
+                  group = "Workplaces",
+                  xlabel = "Workplace",
+                  ylabel = "Percentage change in visits (%)")
+  work_worktime_coef[[i+1]] <- felmCoeff(reg,var = "cutt", omit = c(20, 25)) %>% 
+    select(coef, se, t, p, star, range, semin, semax)
+}
+work_worktime.p
+# work_worktime_coef
+
+
+## 3 Temoral: season
+
+df_work <- season(df_work)
+
+# reg_tem_type<-NULL
+# coef <- NULL
+# tem <- NULL
+work_season.p <- NULL
+work_season_coef <- NULL
+
+for(i in 1:4){
+  dta <- df_work[season == i, with = T]
+  dta <- within(dta , cutt <- relevel(cutt, ref = "(20,25]"))
+  reg <- felm(log_visit ~ cutt + tp + wind + rhum + sp + tcc + holidays +aqi        #   covariates |
+                        |id + hour + month + dow
+                        | 0 |type,
+                      data = dta, na.action="na.omit")
+
+  work_season.p[[i]] <- binned.plot(felm.est = reg,
+                  plotvar = "cutt",
+                  breaks = 5,
+                  omit = c(20, 25),
+                  xlimit = c(-10,40),
+                  ylimit = c(-30,10),
+                  panel = i,
+                  group = "Workplace",
+                  xlabel = "park-season",
+                  ylabel = "Percentage change in visits (%)")
+  work_season_coef[[i]] <- felmCoeff(reg,var = "cutt", omit = c(20, 25)) %>% 
+    select(coef, se, t, p, star, xmin, semin, semax) %>% 
+    mutate(season = i)
+}
+work_season.p
+work_season_coef
+high_work_season <- rbind(work_season_coef[[1]], work_season_coef[[2]], work_season_coef[[3]], work_season_coef[[4]]) %>% 
+  filter(xmin == 35)
+high_work_season$season <- as.factor(high_work_season$season)
+high_work_season %>% 
+  ggplot()+
+    geom_errorbar(mapping=aes(x=season,ymin=semin,ymax=semax),width=0.3,color="black",size=1.5) +
+    geom_bar(mapping=aes(x=season,y=coef,fill=season), size=1.5,position="dodge", stat="identity",width=0.6) +
+  ylab("Margin effect of >30℃") +
+  theme_bw()
+#Urban/Rural 异质性work
+work_urban.p <- NULL
+work_urban_coef <- NULL
+for(i in 0:1){
+  dta <- df_work[urban == i, with = T]
+  dta <- within(dta , cutt <- relevel(cutt, ref = "(20,25]"))
+  reg <- felm(log_visit ~ cutt + tp + wind + rhum + sp + tcc + holidays +aqi        #   covariates |
+                        |id + hour + month + dow
+                        | 0 |type,
+                      data = dta, na.action="na.omit")
+
+  work_urban.p[[i+1]] <- binned.plot(felm.est = reg,
+                  plotvar = "cutt",
+                  breaks = 5,
+                  omit = c(20, 25),
+                  xlimit = c(-10,40),
+                  ylimit = c(-30,10),
+                  panel = i,
+                  group = "Workplace",
+                  xlabel = "urban",
+                  ylabel = "Percentage change in visits (%)")
+  work_urban_coef[[i+1]] <- felmCoeff(reg,var = "cutt", omit = c(20, 25)) %>% 
+    select(coef, se, t, p, star, xmin, range, semin, semax) %>% 
+    mutate(urban = i)
+}
+work_urban.p
+high_work_urban<- rbind(work_urban_coef[[1]], work_urban_coef[[2]]) %>% 
+  filter(xmin == 35)
+high_work_urban$urban <- as.factor(high_work_urban$urban)
+high_work_urban %>% 
+  ggplot()+
+    geom_errorbar(mapping=aes(x=urban,ymin=semin,ymax=semax),width=0.3,color="black",size=1.5) +
+    geom_bar(mapping=aes(x=urban,y=coef,fill=urban), size=1.5,position="dodge", stat="identity",width=0.6) +
+  ylab("Margin effect of >30℃") +
+  theme_bw()
+high_work_urban<- rbind(work_urban_coef[[1]], work_urban_coef[[2]]) %>% 
+  filter(xmin == -5)
+high_work_urban$urban <- as.factor(high_work_urban$urban)
+high_work_urban %>% 
+  ggplot()+
+    geom_errorbar(mapping=aes(x=urban,ymin=semin,ymax=semax),width=0.3,color="black",size=1.5) +
+    geom_bar(mapping=aes(x=urban,y=coef,fill=urban), size=1.5,position="dodge", stat="identity",width=0.6) +
+  ylab("Margin effect of <0℃") +
+  theme_bw()
+grid.arrange(work_urban.p[[1]], work_urban.p[[2]], ncol = 2)
+```
+
+
+
+```{r}
+#| label: recreation heterogeneity
+## 2 Spatial: By  functions 
+#  商业街 ^0610 + 游乐园 ^0805
+
+df_recre$cate<-1
+df_recre$cate[df_recre$type %in% c("061000", "061001")]<-2
+
+# reg_tem_type<-NULL
+# coef <- NULL
+# tem <- NULL
+recre_cate.p <- NULL
+recre_cate_coef <- NULL
+
+for(i in 1:2){
+  dta <- df_recre[cate == i, with = T]
+  dta <- within(dta , cutt <- relevel(cutt, ref = "(20,25]"))
+  reg <- felm(log_visit ~ cutt + tp + wind + rhum + sp + tcc + holidays +aqi        #   covariates |
+                        |id + hour + month + dow
+                        | 0 |type,
+                      data = dta, na.action="na.omit")
+
+  recre_cate.p[[i]] <- binned.plot(felm.est = reg,
+                  plotvar = "cutt",
+                  breaks = 5,
+                  omit = c(20, 25),
+                  xlimit = c(-10,40),
+                  ylimit = c(-30,10),
+                  panel = i,
+                  group = "Park",
+                  xlabel = "park-category",
+                  ylabel = "Percentage change in visits (%)")
+  recre_cate_coef[[i]] <- felmCoeff(reg,var = "cutt", omit = c(20, 25)) %>% 
+    select(coef, se, t, p, star, range, semin, semax)
+}
+recre_cate.p
+# recre_cate_coef
+
+
+## 3 Temoral: holiday
+
+recre_holiday.p <- NULL
+recre_holiday_coef <- NULL
+
+for(i in 0:1){
+  dta <- df_recre[holidays == i, with = T]
+  dta <- within(dta , cutt <- relevel(cutt, ref = "(20,25]"))
+  reg <- felm(log_visit ~ cutt + tp + wind + rhum + sp + tcc +aqi        #   covariates |
+                        |id + hour + month + dow
+                        | 0 |type,
+                      data = dta, na.action="na.omit")
+
+  recre_holiday.p[[i+1]] <- binned.plot(felm.est = reg,
+                  plotvar = "cutt",
+                  breaks = 5,
+                  omit = c(20, 25),
+                  xlimit = c(-10,40),
+                  ylimit = c(-30,10),
+                  panel = i,
+                  group = "Park",
+                  xlabel = "park-holiday",
+                  ylabel = "Percentage change in visits (%)")
+  recre_holiday_coef[[i+1]] <- felmCoeff(reg,var = "cutt", omit = c(20, 25)) %>% 
+    select(coef, se, t, p, star, range, semin, semax)
+}
+recre_holiday.p
+# recre_holiday_coef
+
+
+## 3 Temoral: daytime
+df_park$daytime<-0
+df_park$cate[df_park$type %in% c("080200", "080201","080202")]<-3
+df_park$daytime[df_park$hour >= 6 & df_park$hour <= 18]<-1
+
+reg_tem_type<-NULL
+coef <- NULL
+tem <- NULL
+park_daytime.p <- NULL
+park_daytime_coef <- NULL
+
+for(i in 0:1){
+  dta <- df_park[daytime == i, with = T]
+  dta <- within(dta , cutt <- relevel(cutt, ref = "(20,25]"))
+  reg <- felm(log_visit ~ cutt + tp + wind + rhum + sp + tcc + holidays +aqi        #   covariates |
+                        |id + hour + month + dow
+                        | 0 |type,
+                      data = dta, na.action="na.omit")
+
+  park_daytime.p[[i+1]] <- binned.plot(felm.est = reg,
+                  plotvar = "cutt",
+                  breaks = 5,
+                  omit = c(20, 25),
+                  xlimit = c(-10,40),
+                  ylimit = c(-30,10),
+                  panel = i,
+                  group = "Park",
+                  xlabel = "park-daytime",
+                  ylabel = "Percentage change in visits (%)")
+  park_daytime_coef[[i+1]] <- felmCoeff(reg,var = "cutt", omit = c(20, 25)) %>%
+    select(coef, se, t, p, star, range, semin, semax)
+}
+park_daytime.p
+park_daytime_coef
+
+## 3 Temoral: season
+df_recre <- season(df_recre)
+
+# reg_tem_type<-NULL
+# coef <- NULL
+# tem <- NULL
+recre_season.p <- NULL
+recre_season_coef <- NULL
+
+for(i in 1:4){
+  dta <- df_recre[season == i, with = T]
+  dta <- within(dta , cutt <- relevel(cutt, ref = "(20,25]"))
+  reg <- felm(log_visit ~ cutt + tp + wind + rhum + sp + tcc + holidays +aqi        #   covariates |
+                        |id + hour + month + dow
+                        | 0 |type,
+                      data = dta, na.action="na.omit")
+
+  recre_season.p[[i]] <- binned.plot(felm.est = reg,
+                  plotvar = "cutt",
+                  breaks = 5,
+                  omit = c(20, 25),
+                  xlimit = c(-10,40),
+                  ylimit = c(-30,10),
+                  panel = i,
+                  group = "Recreation",
+                  xlabel = "park-season",
+                  ylabel = "Percentage change in visits (%)")
+  recre_season_coef[[i]] <- felmCoeff(reg,var = "cutt", omit = c(20, 25)) %>% 
+    select(coef, se, t, p, star, range, semin, semax)
+}
+recre_season.p
+# recre_season_coef
+
+```
+
+#### park
+
+从上到下依次是： 公园类型的异质性（City parks/ plaza与Tourism attraction） weekend/holiday 与weekday 白天(6:00-19:00)与晚上
+
+```{r}
+#| label: park heterogeneity
+## 2 Spatial: By park functions 
+#  City parks/ plaza (110101;110106; 110100; 110105 )+ Tourism attraction (including theme parks and temples) (110200; 110201; 110202; 110203;110204; 110209| 110102; 110103; 110104| 110205; 110206; 110207)  Golf (080200;080201;080202)
+
+df_park$cate<-2
+# df_park$cate[df_park$type %in% c("080200", "080201","080202")]<-3
+df_park$cate[df_park$type %in% c("110101", "110106","110100","110105")]<-1    #City park/plaza
+
+# reg_tem_type<-NULL
+# coef <- NULL
+# tem <- NULL
+park_cate.p <- NULL
+park_cate_coef <- NULL
+
+for(i in 1:2){
+  dta <- df_park[cate == i, with = T]
+  dta <- within(dta , cutt <- relevel(cutt, ref = "(20,25]"))
+  reg <- felm(log_visit ~ cutt + tp + wind + rhum + sp + tcc + holidays +aqi        #   covariates |
+                        |id + hour + month + dow
+                        | 0 |type,
+                      data = dta, na.action="na.omit")
+
+  park_cate.p[[i]] <- binned.plot(felm.est = reg,
+                  plotvar = "cutt",
+                  breaks = 5,
+                  omit = c(20, 25),
+                  xlimit = c(-10,40),
+                  ylimit = c(-30,10),
+                  panel = i,
+                  group = "Park",
+                  xlabel = "park-category",
+                  ylabel = "Percentage change in visits (%)")
+  park_cate_coef[[i]] <- felmCoeff(reg,var = "cutt", omit = c(20, 25)) %>% 
+    select(coef, se, t, p, star, range, semin, semax)
+}
+park_cate.p
+# park_cate_coef
+
+
+## 3 Temoral: holiday
+
+park_holiday.p <- NULL
+park_holiday_coef <- NULL
+
+for(i in 0:1){
+  dta <- df_park[holidays == i, with = T]
+  dta <- within(dta , cutt <- relevel(cutt, ref = "(20,25]"))
+  reg <- felm(log_visit ~ cutt + tp + wind + rhum + sp + tcc +aqi        #   covariates |
+                        |id + hour + month + dow
+                        | 0 |type,
+                      data = dta, na.action="na.omit")
+
+  park_holiday.p[[i+1]] <- binned.plot(felm.est = reg,
+                  plotvar = "cutt",
+                  breaks = 5,
+                  omit = c(20, 25),
+                  xlimit = c(-10,40),
+                  ylimit = c(-30,10),
+                  panel = i,
+                  group = "Park",
+                  xlabel = "park-holiday",
+                  ylabel = "Percentage change in visits (%)")
+  park_holiday_coef[[i+1]] <- felmCoeff(reg,var = "cutt", omit = c(20, 25)) %>% 
+    select(coef, se, t, p, star, xmin, semin, semax) %>% 
+    mutate(holiday = i)
+}
+park_holiday.p
+park_holiday_coef
+high_park_holiday <- rbind(park_holiday_coef[[1]], park_holiday_coef[[2]]) %>% 
+  filter(xmin == 35)
+high_park_holiday$holiday <- as.factor(high_park_holiday$holiday)
+high_park_holiday %>% 
+  ggplot()+
+    geom_errorbar(mapping=aes(x=holiday,ymin=semin,ymax=semax),width=0.3,color="black",size=1.5) +
+    geom_bar(mapping=aes(x=holiday,y=coef,fill=holiday), size=1.5,position="dodge", stat="identity",width=0.6) +
+  ylab("Margin effect of >30℃") +
+  theme_bw()
+
+## 3 Temoral: daytime
+df_park$daytime<-0
+# df_park$cate[df_park$type %in% c("080200", "080201","080202")]<-3
+df_park$daytime[df_park$hour >= 6 & df_park$hour <= 18]<-1
+
+# reg_tem_type<-NULL
+# coef <- NULL
+# tem <- NULL
+park_daytime.p <- NULL
+park_daytime_coef <- NULL
+
+for(i in 0:1){
+  dta <- df_park[daytime == i, with = T]
+  dta <- within(dta , cutt <- relevel(cutt, ref = "(20,25]"))
+  reg <- felm(log_visit ~ cutt + tp + wind + rhum + sp + tcc + holidays +aqi        #   covariates |
+                        |id + hour + month + dow
+                        | 0 |type,
+                      data = dta, na.action="na.omit")
+
+  park_daytime.p[[i+1]] <- binned.plot(felm.est = reg,
+                  plotvar = "cutt",
+                  breaks = 5,
+                  omit = c(20, 25),
+                  xlimit = c(-10,40),
+                  ylimit = c(-30,10),
+                  panel = i,
+                  group = "Park",
+                  xlabel = "park-daytime",
+                  ylabel = "Percentage change in visits (%)")
+  park_daytime_coef[[i+1]] <- felmCoeff(reg,var = "cutt", omit = c(20, 25)) %>% 
+    select(coef, se, t, p, star, range, semin, semax)
+}
+park_daytime.p
+# park_daytime_coef
+
+## 3 Temoral: season
+df_park <- season(df_park)
+
+# reg_tem_type<-NULL
+# coef <- NULL
+# tem <- NULL
+park_season.p <- NULL
+park_season_coef <- NULL
+
+for(i in 1:4){
+  dta <- df_park[season == i, with = T]
+  dta <- within(dta , cutt <- relevel(cutt, ref = "(20,25]"))
+  reg <- felm(log_visit ~ cutt + tp + wind + rhum + sp + tcc + holidays +aqi        #   covariates |
+                        |id + hour + month + dow
+                        | 0 |type,
+                      data = dta, na.action="na.omit")
+
+  park_season.p[[i]] <- binned.plot(felm.est = reg,
+                  plotvar = "cutt",
+                  breaks = 5,
+                  omit = c(20, 25),
+                  xlimit = c(-10,40),
+                  ylimit = c(-30,10),
+                  panel = i,
+                  group = "Park",
+                  xlabel = "park-season",
+                  ylabel = "Percentage change in visits (%)")
+  park_season_coef[[i]] <- felmCoeff(reg,var = "cutt", omit = c(20, 25)) %>% 
+    select(coef, se, t, p, star, xmin, semin, semax) %>% 
+    mutate(season = i)
+}
+park_season.p
+park_season_coef
+high_park_season <- rbind(park_season_coef[[1]], park_season_coef[[2]], park_season_coef[[3]], park_season_coef[[4]]) %>% 
+  filter(xmin == 35)
+high_park_season$season <- as.factor(high_park_season$season)
+high_park_season %>% 
+  ggplot()+
+    geom_errorbar(mapping=aes(x=season,ymin=semin,ymax=semax),width=0.3,color="black",size=1.5) +
+    geom_bar(mapping=aes(x=season,y=coef,fill=season), size=1.5,position="dodge", stat="identity",width=0.6) +
+  ylab("Margin effect of >30℃") +
+  theme_bw()
+
+
+# wet_heat_stats <- df_park %>% 
+#   as_tibble() %>% 
+#   group_by(season, cutt) %>% 
+#   dplyr::summarise(
+#     count = n(),
+#     mean = mean(rhum, na.rm = T),
+#     min = min(rhum, na.tm = T),
+#     qu_1st = stats::quantile(rhum, probs = c(0.25)),
+#     qu_3st = stats::quantile(rhum, probs = c(0.75)),
+#     max = max(rhum, na.tm = T)
+#   ) %>% 
+#   arrange(cutt, season)
+#Urban/Rural 异质性 park
+park_urban.p <- NULL
+park_urban_coef <- NULL
+for(i in 0:1){
+  dta <- df_park[urban == i, with = T]
+  dta <- within(dta , cutt <- relevel(cutt, ref = "(20,25]"))
+  reg <- felm(log_visit ~ cutt + tp + wind + rhum + sp + tcc + holidays +aqi        #   covariates |
+                        |id + hour + month + dow
+                        | 0 |type,
+                      data = dta, na.action="na.omit")
+
+  park_urban.p[[i+1]] <- binned.plot(felm.est = reg,
+                  plotvar = "cutt",
+                  breaks = 5,
+                  omit = c(20, 25),
+                  xlimit = c(-10,40),
+                  ylimit = c(-30,10),
+                  panel = i,
+                  group = "park",
+                  xlabel = "income",
+                  ylabel = "Percentage change in visits (%)")
+  park_urban_coef[[i+1]] <- felmCoeff(reg,var = "cutt", omit = c(20, 25)) %>% 
+    select(coef, se, t, p, star, xmin, range, semin, semax) %>% 
+    mutate(urban = i)
+}
+park_urban.p
+high_park_urban <- rbind(park_urban_coef[[1]], park_urban_coef[[2]]) %>% 
+  filter(xmin == -5)
+high_park_urban$urban <- as.factor(high_park_urban$urban)
+high_park_urban %>% 
+  ggplot()+
+    geom_errorbar(mapping=aes(x=urban,ymin=semin,ymax=semax),width=0.3,color="black",size=1.5) +
+    geom_bar(mapping=aes(x=urban,y=coef,fill=urban), size=1.5,position="dodge", stat="identity",width=0.6) +
+  ylab("Margin effect of < 0℃") +
+  theme_bw()
+grid.arrange(park_urban.p[[1]], park_urban.p[[2]], ncol = 2)
+
+#income 异质性park
+park_income.p <- NULL
+park_income_coef <- NULL
+for(i in 0:1){
+  dta <- df_park[income == i, with = T]
+  dta <- within(dta , cutt <- relevel(cutt, ref = "(20,25]"))
+  reg <- felm(log_visit ~ cutt + tp + wind + rhum + sp + tcc + holidays +aqi        #   covariates |
+                        |id + hour + month + dow
+                        | 0 |type,
+                      data = dta, na.action="na.omit")
+
+  park_income.p[[i+1]] <- binned.plot(felm.est = reg,
+                  plotvar = "cutt",
+                  breaks = 5,
+                  omit = c(20, 25),
+                  xlimit = c(-10,40),
+                  ylimit = c(-30,10),
+                  panel = i,
+                  group = "park",
+                  xlabel = "income",
+                  ylabel = "Percentage change in visits (%)")
+  park_income_coef[[i+1]] <- felmCoeff(reg,var = "cutt", omit = c(20, 25)) %>% 
+    select(coef, se, t, p, star, xmin, range, semin, semax) %>% 
+    mutate(income = i)
+}
+park_income.p
+high_park_income <- rbind(park_income_coef[[1]], park_income_coef[[2]]) %>% 
+  filter(xmin == 35)
+high_park_income$income <- as.factor(high_park_income$income)
+high_park_income %>% 
+  ggplot()+
+    geom_errorbar(mapping=aes(x=income,ymin=semin,ymax=semax),width=0.3,color="black",size=1.5) +
+    geom_bar(mapping=aes(x=income,y=coef,fill=income), size=1.5,position="dodge", stat="identity",width=0.6) +
+  ylab("Margin effect of > 30℃") +
+  theme_bw()
+high_park_income <- rbind(park_income_coef[[1]], park_income_coef[[2]]) %>% 
+  filter(xmin == -5)
+high_park_income$income <- as.factor(high_park_income$income)
+high_park_income %>% 
+  ggplot()+
+    geom_errorbar(mapping=aes(x=income,ymin=semin,ymax=semax),width=0.3,color="black",size=1.5) +
+    geom_bar(mapping=aes(x=income,y=coef,fill=income), size=1.5,position="dodge", stat="identity",width=0.6) +
+  ylab("Margin effect of < 0℃") +
+  theme_bw()
+grid.arrange(park_income.p[[1]], park_income.p[[2]], ncol = 2)
+```
+
+### Transport
+
+```{r}
+traf_holiday.p <- NULL
+traf_holiday_coef <- NULL
+
+for(i in 0:1){
+  dta <- df_traf[holidays == i, with = T]
+  dta <- within(dta , cutt <- relevel(cutt, ref = "(20,25]"))
+  reg <- felm(log_visit ~ cutt + tp + wind + rhum + sp + tcc +aqi        #   covariates |
+                        |id + hour + month + dow
+                        | 0 |type,
+                      data = dta, na.action="na.omit")
+
+  traf_holiday.p[[i+1]] <- binned.plot(felm.est = reg,
+                  plotvar = "cutt",
+                  breaks = 5,
+                  omit = c(20, 25),
+                  xlimit = c(-10,40),
+                  ylimit = c(-30,10),
+                  panel = i,
+                  group = "Park",
+                  xlabel = "park-holiday",
+                  ylabel = "Percentage change in visits (%)")
+  traf_holiday_coef[[i+1]] <- felmCoeff(reg,var = "cutt", omit = c(20, 25)) %>% 
+    select(coef, se, t, p, star, xmin, semin, semax) %>% 
+    mutate(holiday = i)
+}
+traf_holiday.p
+traf_holiday_coef
+high_traf_holiday <- rbind(traf_holiday_coef[[1]], traf_holiday_coef[[2]]) %>% 
+  filter(xmin == 35)
+high_traf_holiday$holiday <- as.factor(high_traf_holiday$holiday)
+high_traf_holiday %>% 
+  ggplot()+
+    geom_errorbar(mapping=aes(x=holiday,ymin=semin,ymax=semax),width=0.3,color="black",size=1.5) +
+    geom_bar(mapping=aes(x=holiday,y=coef,fill=holiday), size=1.5,position="dodge", stat="identity",width=0.6) +
+  ylab("Margin effect of >30℃") +
+  theme_bw()
+
+df_traf <- season(df_traf)
+
+traf_season.p <- NULL
+traf_season_coef <- NULL
+
+for(i in 1:4){
+  dta <- df_traf[season == i, with = T]
+  dta <- within(dta , cutt <- relevel(cutt, ref = "(20,25]"))
+  reg <- felm(log_visit ~ cutt + tp + wind + rhum + sp + tcc + holidays +aqi        #   covariates |
+                        |id + hour + month + dow
+                        | 0 |type,
+                      data = dta, na.action="na.omit")
+
+  traf_season.p[[i]] <- binned.plot(felm.est = reg,
+                  plotvar = "cutt",
+                  breaks = 5,
+                  omit = c(20, 25),
+                  xlimit = c(-10,40),
+                  ylimit = c(-30,10),
+                  panel = i,
+                  group = "Park",
+                  xlabel = "park-season",
+                  ylabel = "Percentage change in visits (%)")
+  traf_season_coef[[i]] <- felmCoeff(reg,var = "cutt", omit = c(20, 25)) %>% 
+    select(coef, se, t, p, star, xmin, semin, semax) %>% 
+    mutate(season = i)
+}
+traf_season.p
+traf_season_coef
+high_traf_season <- rbind(traf_season_coef[[1]], traf_season_coef[[2]], traf_season_coef[[3]], traf_season_coef[[4]]) %>% 
+  filter(xmin == 35)
+high_traf_season$season <- as.factor(high_traf_season$season)
+high_traf_season %>% 
+  ggplot()+
+    geom_errorbar(mapping=aes(x=season,ymin=semin,ymax=semax),width=0.3,color="black",size=1.5) +
+    geom_bar(mapping=aes(x=season,y=coef,fill=season), size=1.5,position="dodge", stat="identity",width=0.6) +
+  ylab("Margin effect of >30℃") +
+  theme_bw()
+
+#Urban/Rural 异质性traf
+traf_urban.p <- NULL
+traf_urban_coef <- NULL
+for(i in 0:1){
+  dta <- df_traf[urban == i, with = T]
+  dta <- within(dta , cutt <- relevel(cutt, ref = "(20,25]"))
+  reg <- felm(log_visit ~ cutt + tp + wind + rhum + sp + tcc + holidays +aqi        #   covariates |
+                        |id + hour + month + dow
+                        | 0 |type,
+                      data = dta, na.action="na.omit")
+
+  traf_urban.p[[i+1]] <- binned.plot(felm.est = reg,
+                  plotvar = "cutt",
+                  breaks = 5,
+                  omit = c(20, 25),
+                  xlimit = c(-10,40),
+                  ylimit = c(-30,10),
+                  panel = i,
+                  group = "transport",
+                  xlabel = "urban",
+                  ylabel = "Percentage change in visits (%)")
+  traf_urban_coef[[i+1]] <- felmCoeff(reg,var = "cutt", omit = c(20, 25)) %>% 
+    select(coef, se, t, p, star, xmin, range, semin, semax) %>% 
+    mutate(urban = i)
+}
+traf_urban.p
+high_traf_urban <- rbind(traf_urban_coef[[1]], traf_urban_coef[[2]]) %>% 
+  filter(xmin == 35)
+high_traf_urban$urban <- as.factor(high_traf_urban$urban)
+high_traf_urban %>% 
+  ggplot()+
+    geom_errorbar(mapping=aes(x=urban,ymin=semin,ymax=semax),width=0.3,color="black",size=1.5) +
+    geom_bar(mapping=aes(x=urban,y=coef,fill=urban), size=1.5,position="dodge", stat="identity",width=0.6) +
+  ylab("Margin effect of >30℃") +
+  theme_bw()
+high_traf_urban <- rbind(traf_urban_coef[[1]], traf_urban_coef[[2]]) %>% 
+  filter(xmin == -5)
+high_traf_urban$urban <- as.factor(high_traf_urban$urban)
+high_traf_urban %>% 
+  ggplot()+
+    geom_errorbar(mapping=aes(x=urban,ymin=semin,ymax=semax),width=0.3,color="black",size=1.5) +
+    geom_bar(mapping=aes(x=urban,y=coef,fill=urban), size=1.5,position="dodge", stat="identity",width=0.6) +
+  ylab("Margin effect of < 0℃") +
+  theme_bw()
+grid.arrange(traf_urban.p[[1]], traf_urban.p[[2]], ncol = 2)
+
+#income 异质性traf
+traf_income.p <- NULL
+traf_income_coef <- NULL
+for(i in 0:1){
+  dta <- df_traf[income == i, with = T]
+  dta <- within(dta , cutt <- relevel(cutt, ref = "(20,25]"))
+  reg <- felm(log_visit ~ cutt + tp + wind + rhum + sp + tcc + holidays +aqi        #   covariates |
+                        |id + hour + month + dow
+                        | 0 |type,
+                      data = dta, na.action="na.omit")
+
+  traf_income.p[[i+1]] <- binned.plot(felm.est = reg,
+                  plotvar = "cutt",
+                  breaks = 5,
+                  omit = c(20, 25),
+                  xlimit = c(-10,40),
+                  ylimit = c(-30,10),
+                  panel = i,
+                  group = "transport",
+                  xlabel = "income",
+                  ylabel = "Percentage change in visits (%)")
+  traf_income_coef[[i+1]] <- felmCoeff(reg,var = "cutt", omit = c(20, 25)) %>% 
+    select(coef, se, t, p, star, xmin, range, semin, semax) %>% 
+    mutate(income = i)
+}
+traf_income.p
+high_traf_income <- rbind(traf_income_coef[[1]], traf_income_coef[[2]]) %>% 
+  filter(xmin == 35)
+high_traf_income$income <- as.factor(high_traf_income$income)
+high_traf_income %>% 
+  ggplot()+
+    geom_errorbar(mapping=aes(x=income,ymin=semin,ymax=semax),width=0.3,color="black",size=1.5) +
+    geom_bar(mapping=aes(x=income,y=coef,fill=income), size=1.5,position="dodge", stat="identity",width=0.6) +
+  ylab("Margin effect of >30℃") +
+  theme_bw()
+high_traf_income <- rbind(traf_income_coef[[1]], traf_income_coef[[2]]) %>% 
+  filter(xmin == -5)
+high_traf_income$income <- as.factor(high_traf_income$income)
+high_traf_income %>% 
+  ggplot()+
+    geom_errorbar(mapping=aes(x=income,ymin=semin,ymax=semax),width=0.3,color="black",size=1.5) +
+    geom_bar(mapping=aes(x=income,y=coef,fill=income), size=1.5,position="dodge", stat="identity",width=0.6) +
+  ylab("Margin effect of < 0℃") +
+  theme_bw()
+grid.arrange(traf_income.p[[1]], traf_income.p[[2]], ncol = 2)
+```
+
+Medical
+
+```{r}
+#| label: medical heterogeneity
+## 3 Temoral: holiday
+
+medical_holiday.p <- NULL
+medical_holiday_coef <- NULL
+
+for(i in 0:1){
+  dta <- df_medical[holidays == i, with = T]
+  dta <- within(dta , cutt <- relevel(cutt, ref = "(20,25]"))
+  reg <- felm(log_visit ~ cutt + tp + wind + rhum + sp + tcc +aqi        #   covariates |
+                        |id + hour + month + dow
+                        | 0 |type,
+                      data = dta, na.action="na.omit")
+
+  medical_holiday.p[[i+1]] <- binned.plot(felm.est = reg,
+                  plotvar = "cutt",
+                  breaks = 5,
+                  omit = c(20, 25),
+                  xlimit = c(-10,40),
+                  ylimit = c(-30,10),
+                  panel = i,
+                  group = "Park",
+                  xlabel = "park-holiday",
+                  ylabel = "Percentage change in visits (%)")
+  medical_holiday_coef[[i+1]] <- felmCoeff(reg,var = "cutt", omit = c(20, 25)) %>% 
+    select(coef, se, t, p, star, range, semin, semax)
+}
+medical_holiday.p
+# medical_holiday_coef
+
+
+## 3 Temoral: daytime
+df_medical$daytime<-0
+# df_park$cate[df_park$type %in% c("080200", "080201","080202")]<-3
+df_medical$daytime[df_medical$hour >= 6 & df_medical$hour <= 18]<-1
+
+# reg_tem_type<-NULL
+# coef <- NULL
+# tem <- NULL
+park_daytime.p <- NULL
+park_daytime_coef <- NULL
+
+for(i in 0:1){
+  dta <- df_park[daytime == i, with = T]
+  dta <- within(dta , cutt <- relevel(cutt, ref = "(20,25]"))
+  reg <- felm(log_visit ~ cutt + tp + wind + rhum + sp + tcc + holidays +aqi        #   covariates |
+                        |id + hour + month + dow
+                        | 0 |type,
+                      data = dta, na.action="na.omit")
+
+  park_daytime.p[[i+1]] <- binned.plot(felm.est = reg,
+                  plotvar = "cutt",
+                  breaks = 5,
+                  omit = c(20, 25),
+                  xlimit = c(-10,40),
+                  ylimit = c(-30,10),
+                  panel = i,
+                  group = "Park",
+                  xlabel = "park-daytime",
+                  ylabel = "Percentage change in visits (%)")
+  park_daytime_coef[[i+1]] <- felmCoeff(reg,var = "cutt", omit = c(20, 25)) %>% 
+    select(coef, se, t, p, star, range, semin, semax)
+}
+park_daytime.p
+# park_daytime_coef
+
+## 3 Temoral: season
+df_medical <- season(df_medical)
+
+# reg_tem_type<-NULL
+# coef <- NULL
+# tem <- NULL
+medical_season.p <- NULL
+medical_season_coef <- NULL
+
+for(i in 1:4){
+  dta <- df_medical[season == i, with = T]
+  dta <- within(dta , cutt <- relevel(cutt, ref = "(20,25]"))
+  reg <- felm(log_visit ~ cutt + tp + wind + rhum + sp + tcc + holidays +aqi        #   covariates |
+                        |id + hour + month + dow
+                        | 0 |type,
+                      data = dta, na.action="na.omit")
+
+  medical_season.p[[i]] <- binned.plot(felm.est = reg,
+                  plotvar = "cutt",
+                  breaks = 5,
+                  omit = c(20, 25),
+                  xlimit = c(-10,40),
+                  ylimit = c(-30,10),
+                  panel = i,
+                  group = "Park",
+                  xlabel = "park-season",
+                  ylabel = "Percentage change in visits (%)")
+  medical_season_coef[[i]] <- felmCoeff(reg,var = "cutt", omit = c(20, 25)) %>% 
+    select(coef, se, t, p, star, range, semin, semax)
+}
+medical_season.p
+# medical_season_coef
+
+
+```
+
+###Holiday
+
+```{r}
+reg <- NULL
+holiday_coef <- NULL
+coef_holiday_list <- NULL
+regHoli <- NULL
+for (j in 1:4) {
+  x <- workLiveLabel[j]
+  dt <- df[class == x]
+  for(i in 0:1){
+  dta <- dt[holidays == i, with = T]
+  dta <- within(dta , cutt <- relevel(cutt, ref = "(20,25]"))
+  reg[[i+1]] <- felm(log_visit ~ cutt + tp + wind + rhum + sp + tcc +aqi+blh        #   covariates |
+                        |id + hour + month + dow
+                        | 0 |id,
+                      data = dta, na.action="na.omit")
+  holiday_coef[[i+1]] <- felmCoeff(reg[[i+1]],var = "cutt", omit = c(20, 25)) %>% 
+    select(coef, se, t, p, star,xmin , range, semin, semax) %>% 
+    mutate(holidays = i, class = x)
+  }
+  coef_holiday_list[[j]] <- holiday_coef
+  regHoli[[j]] <- reg
+}
+
+# resid_holiday.p
+high_holiday <- NULL
+for (i in 1:4) {
+  high_holiday <- rbind(high_holiday, coef_holiday_list[[i]][[1]], coef_holiday_list[[i]][[2]]) %>% 
+  filter(xmin == 35 | xmin == -5)
+}
+high_holiday$holiday <- as.factor(high_holiday$holiday)
+high_holiday$class <- factor(high_holiday$class, levels = workLiveLabel)
+high_holiday <- high_holiday %>% as.data.table()
+
+for (i in 1:2) {
+  a <- regHoli[[1]][[i]]
+  b <- regHoli[[2]][[i]]
+  c <- regHoli[[3]][[i]]
+  d <- regHoli[[4]][[i]]
+  
+  stargazer(a, b, c, d,
+            dep.var.labels.include = F,
+            # colnames = c("Residential", "Park", "Transport", "Workplace"),
+            covariate.labels = c("(-10,0]", "(0,5]", "(5,10]", "(10,15]", "(15,20]", "(25,30]", "(30,35]", "(35,40]","tp","wind","rhum","sp","tcc","aqi","blh"),
+            omit.stat = c("LL","ser","f","rsq"),
+            star.cutoffs = c(0.05, 0.01, 0.001),
+            type = "html",
+            out = paste0("~/ClimBehav_bj/results/plots/holiday",i-1,".doc")
+            )
+}
+rm(list = c("a","b","c","d","coef_holiday_list","dt","dta","holiday_coef","reg","regHoli"))
+gc()
+# holiday.p[[1]] <- high_holiday[xmin == 35] %>% 
+#   ggplot(aes(x=holiday,y=coef,fill = class))+
+#     geom_bar(color = "#F0FFFF", position="dodge", stat="identity",width=0.6) +
+#   geom_errorbar(mapping=aes(ymin=semin,ymax=semax), width=0.2, color="black",linewidth=.3, position = position_dodge(0.6)) +
+#   scale_fill_manual(values = classColor) +
+#   ylab("Margin effect of >35℃") +
+#   theme_bw()
+# 
+# holiday.p[[2]] <- high_holiday[xmin == -5] %>% 
+#   ggplot(aes(x=holiday,y=coef,fill = class))+
+#     geom_bar(color = "#F0FFFF", position="dodge", stat="identity",width=0.6) +
+#   geom_errorbar(mapping=aes(ymin=semin,ymax=semax), width=0.2, color="black",linewidth=.3, position = position_dodge(0.6)) +
+#   scale_fill_manual(values = classColor) +
+#   ylab("Margin effect of ≤0℃") +
+#   theme_bw()
+```
+
+### Season
+
+```{r}
+season.p <- NULL
+season_coef <- NULL
+coef_season_list <- NULL
+# df <- season(df)
+for (j in 1:4) {
+  for(i in 1:4){
+  x <- workLiveLabel[j]
+  dt <- df[class == x, with = T]
+  dta <- dt[seasonS == i, with = T]
+  dta <- within(dta , cutt <- relevel(cutt, ref = "(10,15]"))
+  reg <- felm(log_visit ~ cutt + tp + wind + rhum + sp + tcc + holidays +aqi        #   covariates |
+                        |id + hour + month + dow
+                        | 0 |id,
+                      data = dta, na.action="na.omit")
+  season_coef[[i]] <- felmCoeff(reg,var = "cutt", omit = c(10, 15)) %>% 
+    select(coef, se, t, p, star, xmin, semin, semax) %>% 
+    mutate(season = i, class = x, div = "Simple")
+  coef_season_list[[j]] <- season_coef
+  }
+}
+for (j in 1:4) {
+  for(i in 1:4){
+  x <- workLiveLabel[j]
+  dt <- df[class == x, with = T]
+  dta <- dt[seasonTr == i, with = T]
+  dta <- within(dta , cutt <- relevel(cutt, ref = "(10,15]"))
+  reg <- felm(log_visit ~ cutt + tp + wind + rhum + sp + tcc + holidays +aqi        #   covariates |
+                        |id + hour + month + dow
+                        | 0 |id,
+                      data = dta, na.action="na.omit")
+  season_coef[[i]] <- felmCoeff(reg,var = "cutt", omit = c(10, 15)) %>% 
+    select(coef, se, t, p, star, xmin, semin, semax) %>% 
+    mutate(season = i, class = x, div = "Traditional")
+  coef_season_list[[j+4]] <- season_coef
+  }
+}
+# resid_season.p
+high_season <- NULL
+for (i in 1:4) {
+  high_season <- rbind(high_season, rbindlist(coef_season_list[[i+4]])) %>% 
+  filter(xmin == 35 | xmin == -5)
+}
+high_season$season <- as.factor(high_season$season)
+high_season$class <- factor(high_season$class, levels = workLiveLabel)
+high_season <- high_season %>% as.data.table()
+
+# season.p[[1]] <- high_season[xmin == 35] %>% 
+#   ggplot(aes(x=season,y=coef,fill = class))+
+#     geom_bar(color = "#F0FFFF", position="dodge", stat="identity",width=0.6) +
+#   geom_errorbar(mapping=aes(ymin=semin,ymax=semax), width=0.2, color="black",linewidth=.3, position = position_dodge(0.6)) +
+#   scale_fill_manual(values = classColor) +
+#   ylab("Margin effect of >30℃") +
+#   theme_bw()
+# 
+# season.p[[2]] <- high_season[xmin == -5] %>% 
+#   ggplot(aes(x=season,y=coef,fill = class))+
+#     geom_bar(color = "#F0FFFF", position="dodge", stat="identity",width=0.6) +
+#   geom_errorbar(mapping=aes(ymin=semin,ymax=semax), width=0.2, color="black",linewidth=.3, position = position_dodge(0.6)) +
+#   scale_fill_manual(values = classColor) +
+#   ylab("Margin effect of ≤0℃") +
+#   theme_bw()
+```
+
+#### Season classify choose
+
+1.  Simple: Month3\~5, 6\~8, 9\~11, 12\~2 for Spring, Summer, Autumn, Winter
+2.  Astronomy: Vernal equinox, Summer Solstice, Autumnal equinox, Winter Solstice divide
+3.  Traditional: The Beginning of Spring, Summer, Autumn and Winter divide
+4.  Temperature: Threshold of moving average temp. in five days: 10℃ and 22℃(暂时不考虑)
+
+```{r}
+solarTerm2017 <- c(
+  "theBeginningOfSpring" = '20170203',
+  "vernalEquinox" = "20170320",
+  "theBeginningOfSummer" = "20170505",
+  "summerSolstice" = "20170621",
+  "theBeginningOfAutumn" = "20170807",
+  "autumnalEquinox" = "20170923",
+  "theBeginningOfWinter" = "20171107",
+  "winterSolstice" = "20171222"
+  )
+
+seasonS<- function(df){
+  df[,':='(seasonS = 4)]
+  df[month >= 3 & month <= 5, ':='(seasonS = 1)]
+  df[month >= 6 & month <= 8, ':='(seasonS = 2)]
+  df[month >= 9 & month <= 11, ':='(seasonS = 3)]
+  return(df)
+}
+seasonA<- function(df){
+  df[,':='(seasonA = 4)]
+  df[date >= ymd(solarTerm2017[["vernalEquinox"]]) & date < ymd(solarTerm2017[["summerSolstice"]]), ':='(seasonA = 1)]
+  df[date >= ymd(solarTerm2017[["summerSolstice"]]) & date < ymd(solarTerm2017[["autumnalEquinox"]]), ':='(seasonA = 2)]
+  df[date >= ymd(solarTerm2017[["autumnalEquinox"]]) & date < ymd(solarTerm2017[["winterSolstice"]]), ':='(seasonA = 3)]
+  return(df)
+}
+seasonTr<- function(df){
+  df[,':='(seasonTr = 4)]
+  df[date >= ymd(solarTerm2017[["theBeginningOfSpring"]]) & date < ymd(solarTerm2017[["theBeginningOfSummer"]]), ':='(seasonTr = 1)]
+  df[date >= ymd(solarTerm2017[["theBeginningOfSummer"]]) & date < ymd(solarTerm2017[["theBeginningOfAutumn"]]), ':='(seasonTr = 2)]
+  df[date >= ymd(solarTerm2017[["theBeginningOfAutumn"]]) & date < ymd(solarTerm2017[["theBeginningOfWinter"]]), ':='(seasonTr = 3)]
+  return(df)
+}
+seasonS(df)
+seasonA(df)
+seasonTr(df)
+
+```
+
+#####Analysis
+```{r}
+seasonS_t <- NULL
+seasonA_t <- NULL
+seasonTr_t <- NULL
+season_t <- NULL
+season_t_p <- NULL
+for (i in 1:4) {
+  seasonS_t[[i]] <- df[seasonS == i & is.na(class) == F, .(t.max = max(t, na.rm = T), t.min = min(t, na.rm = T), t.mean = mean(t, na.rm = T)), by = .(hour, class)][,':='(season = i, div = "Simple")]
+}
+for (i in 1:4) {
+  seasonA_t[[i]] <- df[seasonA == i & is.na(class) == F, .(t.max = max(t, na.rm = T), t.min = min(t, na.rm = T), t.mean = mean(t, na.rm = T)), by = .(hour, class)][,':='(season = i, div = "Astronomy")]
+}
+for (i in 1:4) {
+  seasonTr_t[[i]] <- df[seasonTr == i & is.na(class) == F, .(t.max = max(t, na.rm = T), t.min = min(t, na.rm = T), t.mean = mean(t, na.rm = T)), by = .(hour, class)][,':='(season = i, div = "Traditional")]
+}
+
+season_t <-rbindlist(rbind.fill.matrix(rbind(seasonS_t, seasonA_t, seasonTr_t)))
+seasonLabel <- c("Spring", "Summer", "Autumn", "Winter")
+nameSeason <- function(x){
+  x <- x %>% 
+  factor() %>% 
+  revalue(c("1" = "Spring", "2" = "Summer", "3" = "Autumn", "4" = "Winter")) %>% 
+  factor(labels = c("Spring", "Summer", "Autumn", "Winter"))
+  return(x)
+}
+season_t$season <- nameSeason(season_t$season)
+
+
+###以季节和行为类别分面，展示温度分布
+###证明各类行为之间的四季温度分布没有太大区别
+season_t_p[[1]] <- ggplot(season_t[div == "Simple"])+
+  facet_grid(class~season)+
+  geom_ribbon(mapping = aes(x = hour,
+                              ymax = t.max, 
+                              ymin = t.min ,fill = season)) + 
+  geom_line(mapping = aes(x = hour,
+                            y = t.mean, colour = season)) +
+  scale_fill_manual(values = c("Winter" = "#e6f1f3", "Spring" ="#D3e1ae", "Summer" = "#eea2a4", "Autumn" = "#f8e8c1")) +
+  scale_color_manual(values = c("Winter" = "#457b9d", "Spring" ="#84a729", "Summer" = "#C75c64", "Autumn" = "#f0b57d")) +
+  ylab("Temperature") +
+  coord_cartesian(y = c(-10,40), expand = T)+
+  theme_bw() 
+
+###以季节和季节划分方式分面
+season_t_p[[2]] <- ggplot(season_t[class == workLiveLabel[1]])+
+  facet_grid(season~div)+
+  geom_ribbon(mapping = aes(x = hour,
+                              ymax = t.max, 
+                              ymin = t.min ,fill = season)) + 
+  geom_line(mapping = aes(x = hour,
+                            y = t.mean, colour = season)) +
+  scale_fill_manual(values = c("Winter" = "#e6f1f3", "Spring" ="#D3e1ae", "Summer" = "#eea2a4", "Autumn" = "#f8e8c1")) +
+  scale_color_manual(values = c("Winter" = "#457b9d", "Spring" ="#84a729", "Summer" = "#C75c64", "Autumn" = "#f0b57d")) +
+  ylab("Temperature") +
+  coord_cartesian(y = c(-10,40), expand = T)+
+  theme_bw() 
+
+```
+
+
+
+###Urban
+
+```{r}
+#Urban/Rural 异质性探究
+urban_coef <- NULL
+coef_urban_list <- NULL
+regUr <- NULL
+reg <- NULL
+for (j in 1:4) {
+  x <- workLiveLabel[j]
+  dt <- df[class == x]
+  for(i in 0:1){
+  dta <- dt[urban == i, with = T]
+  dta <- within(dta , cutt <- relevel(cutt, ref = "(20,25]"))
+  reg[[i+1]] <- felm(log_visit ~ cutt + tp + wind + rhum + sp + tcc + holidays +aqi+ blh        #   covariates |
+                        |id + hour + month + dow
+                        | 0 |id,
+                      data = dta, na.action="na.omit")
+  urban_coef[[i+1]] <- felmCoeff(reg[[i+1]],var = "cutt", omit = c(20, 25)) %>% 
+    select(coef, se, t, p, star,xmin , range, semin, semax) %>% 
+    mutate(urban = i, class = x)
+  }
+  coef_urban_list[[j]] <- urban_coef
+  regUr[[j]] <- reg
+}
+
+
+# resid_urban.p
+high_urban <- NULL
+for (i in 1:4) {
+  high_urban <- rbind(high_urban, coef_urban_list[[i]][[1]], coef_urban_list[[i]][[2]]) %>% 
+  filter(xmin == 35 | xmin == -5)
+}
+high_urban$urban <- as.factor(high_urban$urban)
+high_urban$class <- factor(high_urban$class, levels = workLiveLabel)
+high_urban <- high_urban %>% as.data.table()
+
+for (i in 1:2) {
+  a <- regUr[[1]][[i]]
+  b <- regUr[[2]][[i]]
+  c <- regUr[[3]][[i]]
+  d <- regUr[[4]][[i]]
+  
+  stargazer(a, b, c, d,
+            dep.var.labels.include = F,
+            # colnames = c("Residential", "Park", "Transport", "Workplace"),
+            covariate.labels = c("(-10,0]", "(0,5]", "(5,10]", "(10,15]", "(15,20]", "(25,30]", "(30,35]", "(35,40]","tp","wind","rhum","sp","tcc","holidays","aqi","blh"),
+            omit.stat = c("LL","ser","f","rsq"),
+            star.cutoffs = c(0.05, 0.01, 0.001),
+            type = "html",
+            out = paste0("~/ClimBehav_bj/results/plots/urban",i-1,".doc")
+            )
+}
+rm(list = c("a","b","c","d","coef_urban_list","dt","dta","urban_coef","reg","regUr"))
+gc()
+# urban.p[[1]] <- high_urban[xmin == 35] %>% 
+#   ggplot(aes(x=urban,y=coef,fill = class))+
+#     geom_bar(color = "#F0FFFF", position="dodge", stat="identity",width=0.6) +
+#   geom_errorbar(mapping=aes(ymin=semin,ymax=semax), width=0.2, color="black",linewidth=.3, position = position_dodge(0.6)) +
+#   scale_fill_manual(values = classColor) +
+#   ylab("Margin effect of >35℃") +
+#   theme_bw()
+# 
+# urban.p[[2]] <- high_urban[xmin == -5] %>% 
+#   ggplot(aes(x=urban,y=coef,fill = class))+
+#     geom_bar(color = "#F0FFFF", position="dodge", stat="identity",width=0.6) +
+#   geom_errorbar(mapping=aes(ymin=semin,ymax=semax), width=0.2, color="black",linewidth=.3, position = position_dodge(0.6)) +
+#   scale_fill_manual(values = classColor) +
+#   ylab("Margin effect of ≤0℃") +
+#   theme_bw()
+# grid.arrange(resid_urban.p[[1]], resid_urban.p[[2]], ncol = 2)
+
+```
+
+###Income 分布
+
+```{r}
+#分布
+# df[subclass == 1 & income == 1, .N]/5475 #3154
+# df[subclass == 2 & income == 1, .N]/5475 #151
+# df[subclass == 3 & income == 1, .N]/5475 #60
+# df[subclass == 4 & income == 1, .N]/5475 #4
+# df[subclass == 5 & income == 1, .N]/5475 #1
+# df[subclass == 6 & income == 1, .N]/5475 #113
+# df[subclass == 7 & income == 1, .N]/5475 #1174
+# df[subclass == 8 & income == 1, .N]/5475 #10
+# 
+# df[subclass == 1 & income == 0, .N]/5475 # 3690
+# df[subclass == 2 & income == 0, .N]/5475 #175
+# df[subclass == 3 & income == 0, .N]/5475 #131
+# df[subclass == 4 & income == 0, .N]/5475 #39
+# df[subclass == 5 & income == 0, .N]/5475 #0
+# df[subclass == 6 & income == 0, .N]/5475 #143
+# df[subclass == 7 & income == 0, .N]/5475 #446
+# df[subclass == 8 & income == 0, .N]/5475 #36
+```
+
+```{r}
+
+#Income 异质性探究 Residential
+income_coef <- NULL
+coef_income_list <- NULL
+regInc <- NULL
+reg <- NULL
+
+for (i in 1:4) {
+  x <- workLiveLabel[i]
+  dt <- df[class == x]
+  for(j in 0:1){
+    dta <- dt[income == j, with = T]
+    dta <- within(dta , cutt <- relevel(cutt, ref = "(20,25]"))
+    reg[[j+1]] <- felm(log_visit ~ cutt + tp + wind + rhum + sp + tcc + holidays +aqi+blh        #   covariates |
+                          |id + hour + month + dow
+                          | 0 |id,
+                        data = dta, na.action="na.omit")
+    income_coef[[j+1]] <- felmCoeff(reg[[j+1]],var = "cutt", omit = c(20, 25)) %>% 
+      select(coef, se, t, p, star,xmin , range, semin, semax) %>% 
+      mutate(income = j, class = x)
+  }
+  coef_income_list[[i]] <- income_coef
+  regInc[[i]] <- reg
+}
+
+# resid_income.p
+high_income <- NULL
+for (i in 1:4) {
+  high_income <- rbind(high_income, coef_income_list[[i]][[1]], coef_income_list[[i]][[2]]) %>% 
+  filter(xmin == 35 | xmin == -5)
+}
+high_income$income <- as.factor(high_income$income)
+high_income$class <- factor(high_income$class, levels = workLiveLabel)
+high_income <- high_income %>% as.data.table()
+
+for (i in 1:2) {
+  a <- regInc[[1]][[i]]
+  b <- regInc[[2]][[i]]
+  c <- regInc[[3]][[i]]
+  d <- regInc[[4]][[i]]
+  
+  stargazer(a, b, c, d,
+            dep.var.labels.include = F,
+            # colnames = c("Residential", "Park", "Transport", "Workplace"),
+            covariate.labels = c("(-10,0]", "(0,5]", "(5,10]", "(10,15]", "(15,20]", "(25,30]", "(30,35]", "(35,40]","tp","wind","rhum","sp","tcc","holidays","aqi","blh"),
+            omit.stat = c("LL","ser","f","rsq"),
+            star.cutoffs = c(0.05, 0.01, 0.001),
+            type = "html",
+            out = paste0("~/ClimBehav_bj/results/plots/income",i-1,".doc")
+            )
+}
+rm(list = c("a","b","c","d","coef_income_list","dt","dta","income_coef","reg","regInc"))
+gc()
+# income.p[[1]] <- high_income[xmin == 35] %>% 
+#   ggplot(aes(x=income,y=coef,fill = class))+
+#     geom_bar(color = "#F0FFFF", position="dodge", stat="identity",width=0.6) +
+#   geom_errorbar(mapping=aes(ymin=semin,ymax=semax), width=0.2, color="black",linewidth=.3, position = position_dodge(0.6)) +
+#   scale_fill_manual(values = classColor) +
+#   ylab("Margin effect of >35℃") +
+#   theme_bw()
+# 
+# income.p[[2]] <- high_income[xmin == -5] %>% 
+#   ggplot(aes(x=income,y=coef,fill = class))+
+#     geom_bar(color = "#F0FFFF", position="dodge", stat="identity",width=0.6) +
+#   geom_errorbar(mapping=aes(ymin=semin,ymax=semax), width=0.2, color="black",linewidth=.3, position = position_dodge(0.6)) +
+#   scale_fill_manual(values = classColor) +
+#   ylab("Margin effect of ≤0℃") +
+#   theme_bw()
+
+save(high_holiday,high_urban,high_income,file = "~/ClimBehav_bj/results/data/processed/pHeter.RData")
+# grid.arrange(resid_income.p[[1]], resid_income.p[[2]], ncol = 2)
+gc()
+```
+#all regression
+```{r}
+reg <- NULL
+for (i in 1:4) {
+  x <- workLiveLabel[i]
+  dt <- df[class == x]
+  dt <- within(dt, cutt <- relevel(cutt, ref = "(20,25]"))
+
+  reg[[i]] <- felm(log_visit ~
+                      cutt + tp + wind + rhum + sp + tcc + holidays +aqi +blh
+                     |id + hour + month + dow
+                     |0|id,
+                      data = dt, na.action="na.omit")
+}
+stargazer(reg[[1]], reg[[2]], reg[[3]], reg[[4]],
+          dep.var.labels.include = F,
+          # colnames = c("Residential", "Park", "Transport", "Workplace"),
+          covariate.labels = c("(-10,0]", "(0,5]", "(5,10]", "(10,15]", "(15,20]", "(25,30]", "(30,35]", "(35,40]","tp","wind","rhum","sp","tcc","holidays","aqi","blh"),
+          omit.stat = c("LL","ser","f","rsq"),
+          star.cutoffs = c(0.05, 0.01, 0.001),
+          type = "html",
+          out = "~/ClimBehav_bj/results/plots/heteRegression.doc"
+          )
+```
+
+#Chow 检验
+计算这部分请将上述heter计算的内容全部清除
+
+```{r}
+rm(list = c("dta", "dt", "a","b","c","d","coef_holiday_list","coef_income_list","coef_urban_list","high_holiday","high_income","high_ruban","holiday_coef","holiday.p","income_coef","income.p","reg","regHoli","regInc","regUr","urban_coef","urban.p"))
+gc()
+```
+
+```{r}
+
+holidayChow <- NULL
+urbanChow <- NULL
+incomeChow <- NULL
+#holiday
+for (j in 1:4) {
+  x <- workLiveLabel[j]
+  dta <- df[class == x]
+  dta <- within(dta , cutt <- relevel(cutt, ref = "(20,25]"))
+  holidayChow[[j]] <- felm(log_visit ~ cutt*holidays + tp*holidays + wind*holidays + rhum*holidays + sp*holidays + tcc*holidays +aqi*holidays + blh*holidays       #   covariates |
+                        |id + hour + month + dow
+                        | 0 |id + holidays,
+                      data = dta, na.action="na.omit")
+  }
+#urban
+for (j in 1:4) {
+  x <- workLiveLabel[j]
+  dta <- df[class == x]
+  dta <- within(dta , cutt <- relevel(cutt, ref = "(20,25]"))
+  urbanChow[[j]] <- felm(log_visit ~ cutt*urban + tp*urban + wind*urban + rhum*urban + sp*urban + tcc*urban + holidays*urban +aqi*urban +blh*urban        #   covariates |
+                        |id + hour + month + dow
+                        | 0 |id + urban,
+                      data = dta, na.action="na.omit")
+  }
+#income
+for (i in 1:4) {
+  x <- workLiveLabel[i]
+  dta <- df[class == x]
+  dta <- within(dta , cutt <- relevel(cutt, ref = "(20,25]"))
+  incomeChow[[i]] <- felm(log_visit ~ cutt*income + tp*income + wind*income + rhum*income + sp*income + tcc*income + holidays*income +aqi*income+blh*income        #   covariates|
+                          |id + hour + month + dow
+                          | 0 |id + income,
+                        data = dta, na.action="na.omit")
+}
+
+#output regression results
+library(stargazer)
+#preview
+stargazer(holidayChow[[1]],holidayChow[[2]],holidayChow[[3]],holidayChow[[4]],
+          # coef_holiday_list[[2]], coef_holiday_list[[3]], coef_holiday_list[[4]],
+         dep.var.labels.include = F,
+         # omit.stat = c("LL","ser","f","rsq"),
+         keep = c(17,24),
+         star.cutoffs = c(0.05, 0.01, 0.001),
+         type = "text"
+         # out = "~/ClimBehav_bj/results/plots/holidayChow.doc"
+)
+stargazer(holidayChow[[1]],holidayChow[[2]],holidayChow[[3]],holidayChow[[4]],
+          # coef_holiday_list[[2]], coef_holiday_list[[3]], coef_holiday_list[[4]],
+         dep.var.labels.include = F,
+         # omit.stat = c("LL","ser","f","rsq"),
+         keep = c(17,24),
+         star.cutoffs = c(0.05, 0.01, 0.001),
+         type = "html",
+         out = "~/ClimBehav_bj/results/plots/holidayChow.doc"
+)
+stargazer(urbanChow[[1]],urbanChow[[2]],urbanChow[[3]],urbanChow[[4]],
+          # coef_holiday_list[[2]], coef_holiday_list[[3]], coef_holiday_list[[4]],
+         dep.var.labels.include = F,
+         keep = c(17,24),
+         # omit.stat = c("LL","ser","f","rsq"),
+         star.cutoffs = c(0.05, 0.01, 0.001),
+         type = "html",
+         out = "~/ClimBehav_bj/results/plots/urbanChow.doc"
+)
+stargazer(incomeChow[[1]],incomeChow[[2]],incomeChow[[3]],incomeChow[[4]],
+          # coef_holiday_list[[2]], coef_holiday_list[[3]], coef_holiday_list[[4]],
+         dep.var.labels.include = F,
+         keep = c(17,24),
+         # omit.stat = c("LL","ser","f","rsq"),
+         star.cutoffs = c(0.05, 0.01, 0.001),
+         type = "html",
+         out = "~/ClimBehav_bj/results/plots/incomeChow.doc"
+)
+```

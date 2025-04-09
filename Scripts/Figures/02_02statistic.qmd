@@ -1,0 +1,1299 @@
+---
+title: "人群对极端天气的时空间响应行为研究"
+author: "Yu Chen"
+date: "2023-4-24"
+update:"2025-3-12"
+format: 
+  # pdf:
+  #   toc: true
+  #   number-sections: true
+  #   colorlinks: true
+  html:
+    code-fold: true
+    code-tools: true
+editor: source
+---
+## Set up packages and environment
+```{r}
+#| label: load-packages
+#| warning: false
+
+library(tidyverse)
+library(terra)       #处理栅格数据
+library(magrittr)    #提供管道操作
+library(lubridate)    #提供时间有关函数
+library(data.table)
+library(fixest)   #提供feols函数
+library(lfe)  #提供felm函数
+library(ggExtra) # for marginal histograms
+library(plyr) #for additional manipulation functions
+library(gridExtra) # for multiplots
+
+
+source("~/ClimBehav_bj/results/scripts/binned_plot_function.R")
+source("~/ClimBehav_bj/results/scripts/change_plot.R")
+load("~/ClimBehav_bj/results/data/raw/01_AOI/11-北京市-aoi.Rdata") #load AOI
+
+threshold <- function(dt, a){
+  visit.stat <- dt %>% group_by(id) %>% dplyr::summarise(daily_visit_num = sum(visits / 365, na.rm = T))
+  base_select <- filter(visit.stat, daily_visit_num >= a)
+  dt <- dt %>%
+    dplyr::filter(id %in% base_select$id)
+  return(dt)
+}
+
+```
+
+## Data preparation
+(1) filter out large parks with visitors greater than 1000 people per day;
+(2) filter out the daytime 、compute and select the variables needed
+
+
+```{r}
+#| label: Data preparation
+#| eval: true
+#读取climate_mp数据()
+df <- fread(file = "~/ClimBehav_bj/results/data/processed/climate_mp.csv.gz", nThread = 14)
+
+#df数据集还原
+dig = 3
+cutt_levels <- c("(-10,-5]", "(-5,0]", "(0,5]", "(5,10]", "(10,15]", "(15,20]", "(20,25]", "(25,30]", "(30,35]", "(35,40]")
+# cutt_levels <- c("(-10,-5]", "(-5,0]", "(0,5]", "(5,10]", "(10,15]", "(15,20]", "(20,25]", "(25,30]", "(30,40]") 
+# cutt_levels <- c("(-9,-6]", "(-6,-3]", "(-3,0]", "(0,3]", "(3,6]", "(6,9]", "(9,12]", "(12,15]", "(15,18]","(18,21]", "(21,24]", "(24,27]", "(27,30]", "(30,33]", "(33,36]", "(36,39]", "(39,42]")
+df <- df %>% 
+  transmute(
+    id, 
+    # type = str_sub(type, 1, 6),
+    type,
+    year, month, day, hour, dow, holidays,
+    t = t / 10 ^ dig, 
+    sp = sp / 10^dig,   #将单位换算成hPa
+    tp = tp * 10^3,    #将单位换算成mm
+    blh = blh / 10^dig, 
+    tcc = tcc / 10^3,     #将单位换算成%   
+    wind = wind / 10^dig,
+    rhum = rhum / 10^dig,
+    visits = as.double(visits),
+    cutt = factor(cut(t, breaks = c(seq(from = -10, to = 40, by = 5))), levels = cutt_levels),
+    aqi
+  )
+
+# df_count <- sample_n(df[,.(cases, cutt)], 1e5)
+# cutt_levels <- c(
+#   "(-25,-20]", "(-20,-15]", "(-15,-10]", "(-10,-5]", "(-5,0]", "(0,5]", "(5,10]", "(10,15]", "(15,20]", "(20,25]", "(25,30]", "(30,35]", "(35,40]")
+# df_count$cutt <- factor(df_count$cutt, levels = cutt_levels)
+# label <- tibble(
+#   x = as.factor("(-10,-5]"),
+#   y = c(7500, 10000 ,15000), 
+#   labels = c("cases >= 100", "cases >= 10", "cases >= 0")
+# )
+# 
+# ggplot() +
+#   geom_bar(data = df, mapping = aes(cutt), fill = "#FF8800", show.legend = T)
+#   geom_bar(data = df_count[cases >= 10], mapping = aes(cutt), fill = "#66CD00", show.legend = T) +
+#   geom_bar(data = df_count[cases >= 100], mapping = aes(cutt), fill = "#77FF00",show.legend = T ) +
+#   geom_segment(data = df_count, mapping = aes(x = "(-10,-5]", y = 7500, xend = "(-5,0]", yend = 7500)) +
+#   geom_segment(data = df_count, mapping = aes(x = "(-10,-5]", y = 10000, xend = "(-5,0]", yend = 10000)) +
+#   geom_segment(data = df_count, mapping = aes(x = "(-10,-5]", y = 15000, xend = "(-5,0]", yend = 15000)) +
+  # geom_text(
+  #   aes(x, y, label = labels),
+  #   data = label,
+  #   hjust = "right",
+  #   vjust = "center")
+# df[visits == 0, .N]/df[,.N]
+# visits == 0 占比 ：
+#     ---                percent
+# visits >= 10           18.28%
+# visits >= 100          4.13%
+# visits >= 200          2.21%
+# visits >= 500          0.44%
+# visits >= 1000         0.08%
+
+
+
+# visit.stat <- df %>% group_by(id) %>% dplyr::summarise(daily_visit_num = sum(visits / 365, na.rm = T))
+# # large_select <- filter(visit.stat, daily_visit_num >= 1000)
+# mid_select <- filter(visit.stat, daily_visit_num >= 500)
+# small_select <- filter(visit.stat, daily_visit_num >= 10)
+
+# df_count <- sample_n(df[,.(id, visits, cutt)], 1e5)
+# 
+# ggplot() +
+# geom_bar(data = df_count[id %in% small_select$id], mapping = aes(cutt), fill = "#FF8800", show.legend = T) +
+# geom_bar(data = df_count[id %in% mid_select$id], mapping = aes(cutt), fill = "#66CD00", show.legend = T) +
+# geom_bar(data = df_count[id %in% large_select$id], mapping = aes(cutt), fill = "#77FF00",show.legend = T )
+
+
+# cache <- df
+# df <- df %>%
+#   # dplyr::filter(id %in% large_select$id & hour >= 6 & hour <= 22) %>%
+#   # mutate(log_visit = log(visits + 1))
+#   dplyr::filter(id %in% mid_select$id & hour >= 6 & hour <= 22) %>%
+#   mutate(log_visit = log(visits + 1))
+# 
+# 
+# # rm(list = c("visit.stat", "large_select"))
+# rm(list = c("visit.stat", "mid_select"))
+```
+
+##Classification 
+这一部分主要为了探究如何从mp数据中找到能代表全域的AOI，并且将现有类别进行clear
+
+```{r}
+###### 1.classification ######
+##############################
+
+df_classify<- aoi %>% as.data.table()
+#######1.居家行为#########
+df_classify[str_detect(type, "^120302") & str_detect(name, "(建设中)|(装修中)") == 0, ':='(class = 1, subclass = 1)] #住宅小区
+
+#######2.公园访问#########
+df_classify[str_detect(type, "^1101(00|01|05|06)") & str_detect(name, "(建设中)|(装修中)") == 0, ':='(class = 2, subclass = 2)] #公园广场和内部设施
+df_classify[str_detect(type, "^1101(02|03|04)") & str_detect(name, "(建设中)|(装修中)") == 0, ':='(class = 2, subclass = 3)] #主题公园
+df_classify[str_detect(type, "^1102(00|01|02|03|04|05|06|07|09)") & str_detect(name, "(建设中)|(装修中)") == 0, ':='(class = 2, subclass = 4)] #风景名胜
+
+####### 3.Transport #########
+df_classify[str_detect(type, "^(150104|150200|1504)") & str_detect(name, "(建设中)|(装修中)") == 0, ':='(class = 3, subclass = 5)] #机场、火车站、长途车站
+df_classify[str_detect(type, "^1503(01|02|03)|151200") & str_detect(name, "(建设中)|(装修中)") == 0, ':='(class = 3, subclass = 6)] #渡口、港口
+
+#######4.Work#########
+df_classify[str_detect(type, "^1704") & str_detect(name, "(建设中)|(装修中)") == 0, ':='(class = 4, subclass = 7)] #农林牧渔基地
+df_classify[str_detect(type, "^1202|^17(01|02)") & str_detect(name, "(建设中)|(装修中)") == 0, ':='(class = 4, subclass = 8)] #公司企业、写字楼
+df_classify[str_detect(type, "^1703|^1201") & str_detect(name, "(建设中)|(装修中)") == 0, ':='(class = 4, subclass = 9)] #工厂，产业园
+df_classify[str_detect(name, "(建设中)|(装修中)"), ':='(class = 4, subclass = 10)] #建筑工地,需要放在所有分类的最后
+df_classify <- df_classify[is.na(class) == 0, .(id, class, subclass)]
+df <- inner_join(df_classify, df, by = "id", relationship = "many-to-many")
+rm(df_classify)
+gc()
+#threshold by class
+df <- df %>% threshold(50) %>%
+  dplyr::filter(hour >= 7 & hour <= 22)
+gc()
+```
+## Exploratory data analysis
+
+```{r}
+# Numbers of class and subclass AOIs after threthold
+class <- NULL
+subCl <- NULL
+for (i in 1:4) {
+  class[i] = df[class == i, .N]/5840
+}
+for (i in 1:10) {
+  subCl[i] = df[subclass == i, .N]/5840
+}
+
+#Catogaries of class and subclass AOIs after threthold
+Cclass <- NULL
+CsubCl <- NULL
+for (i in 1:4) {
+  Cclass[i] = sum(is.na(unique(substring(df[class == i, type],1,6)))==0)
+}
+for (i in 1:10) {
+  CsubCl[i] = sum(is.na(unique(substring(df[subclass == i, type],1,6)))==0)
+}
+```
+
+## Main regression
+只计算每个混合类型的第一种type
+
+```{r}
+#| label: visit_separate
+#| eval: true
+
+# #分别计算小时市平均温度、日内市平均温度、日内市最高温度
+# # df[, time := make_datetime(year, month, day, hour)]
+# # df <- df[, havg_heat := mean(t), keyby = time][, davg_heat := mean(t), keyby = as.Date(time)][, max_heat := max(t), keyby = as.Date(time)]
+# 
+# # ------------1.居住地点类(4.5 kw)
+# df_resid <- df %>% filter(type %in% unique(str_subset(type, "^1203")))
+# # df_resid2 <- df %>% filter(type %in% unique(str_subset(type, "^1001")))
+# 
+# 
+# #------------2.工作地点类(1.1kw)
+# # df_work <- df %>% filter(type %in% unique(str_subset(type, "^1200|^1201|^1202|^1411|^17")))
+# df_work <- df %>% filter(type %in% unique(str_subset(type, "^1201|^17(03|04)")))
+# 
+# 
+# 
+# #------------3.文化和娱乐类(300w)
+# # df_recre <- df %>% filter(type %in% unique(str_subset(type, "^05|^06(01|10)|^08(03|04|05|06)|^14(00|01|02|03|04|05|06|07|08|09|10)")))
+# df_recre <- df %>% filter(type %in% unique(str_subset(type, "^0610|^0805")))
+# 
+# 
+# #------------4.公园类(400w)
+# df_park <- df %>% filter(type %in% unique(str_subset(type, "^1101|^1102(00|01|02|03|04|05|06|07|09)")))
+# # df_park <- df %>% filter(type %in% unique(str_subset(type, "^1101|^1102(00|01|02|03|04|05|06|07|09)|^0802")))
+# 
+# 
+# 
+# # #------------5.出行类(30w)
+# # df_tran <- df %>% filter(type %in% unique(str_subset(type, "^15")))
+# 
+# 
+# #------------6.购物类(200w)
+# # df_shop <- df %>% filter(type %in% unique(str_subset(type, "^02|^06(02|03|04|05|06|07|08|09|11|12|13|14)")))
+# 
+# #------------7.医疗类(200w)
+# df_medical <- df %>% filter(type %in% unique(str_subset(type, "^09(01|03|04|05|06)")))
+
+
+# #------------1.居住地点类(8743)
+# df_resid <- df %>% filter(type %in% unique(str_subset(type, "\\|1203|^1203")))
+# 
+# 
+# #------------2.工作地点类(2648)
+# df_work <- df %>% filter(type %in% unique(str_subset(type, "\\|1200|^1200|\\|1201|^1201|\\|1202|^1202|\\|1411|^1411|\\|17|^17")))
+# 
+# 
+# 
+# #------------3.文化和娱乐类()
+# df_recre <- df %>% filter(type %in% unique(str_subset(type, "\\|05|^05|\\|06(01|10)|^06(01|10)|\\|08(03|04|05|06)|^08(03|04|05|06)|\\|14(00|01|02|03|04|05|06|07|08|09|10)|^14(00|01|02|03|04|05|06|07|08|09|10)")))
+# 
+# 
+# #------------4.公园类(863)
+# df_park <- df %>% filter(type %in% unique(str_subset(type, "\\|1101|^1101|^1102(00|01|02|03|04|05|06|07|09)|\\|1102(00|01|02|03|04|05|06|07|09)")))
+# 
+# 
+# #------------5.出行类(173)
+# df_tran <- df %>% filter(type %in% unique(str_subset(type, "\\|15|^15")))
+# 
+# 
+# #------------6.购物类(815)
+# df_shop <- df %>% filter(type %in% unique(str_subset(type, "\\|02|^02|\\|06(02|03|04|05|06|07|08|09|11|12|13|14)|^06(02|03|04|05|06|07|08|09|11|12|13|14)")))
+# 
+# #------------7.教育类(4927)
+# df_edu <- df %>% filter(type %in% unique(str_subset(type, "\\|14(12|13|14|15)|^14(12|13|14|15)")))
+# 
+# #------------8.医疗类
+# df_medical <- df %>% filter(type %in% unique(str_subset(type, "\\|09|^09")))
+
+df_resid[, .N]/6205
+df_work[, .N]/6205
+df_tran[, .N]/6205
+df_park[, .N]/6205
+# df_medical[, .N]/6205
+
+#分类别的0访问含量
+class0perc <- NULL
+
+for(i in 1:4){
+  x <- workLiveLabel[i]
+  dt <- df[class == x]
+  class0perc[[i]] <- dt[visits == 0, .N]/dt[,.N]
+}
+
+
+```
+
+
+
+#### Residential
+
+标准误差集群：type
+
+```{r}
+#| label: residential_level regression
+#| warning: false
+
+
+# 设定被省略的因子
+df_resid <- within(df_resid, cutt <- relevel(cutt, ref = "(20,25]"))
+
+t_fe_resid <- felm(log_visit ~
+                    cutt + tp + wind + rhum + sp + tcc + holidays +aqi +blh        #   covariates |
+                   |id + hour + month + dow
+                   |0|type,
+                    data = df_resid, na.action="na.omit")
+summary(t_fe_resid)
+base_resid <- felmCoeff(t_fe_resid,var = "cutt", omit = c(20, 25)) %>% 
+    select(coef, se, star, xmid, range, semin, semax)
+
+t_resid.p <-binned.plot(felm.est = t_fe_resid,
+                  plotvar = "cutt",
+                  breaks = 5,
+                  omit = c(20, 25),
+                  xlimit = c(-10,40),
+                  ylimit = c(-30,10),
+                  panel = "a",
+                  group = "Residential",
+                  xlabel = "hourly Temp. in ℃",
+                  ylabel = "Percentage change in visits (%)"
+)
+
+t_resid.p
+t_resid.p + geom_vline(xintercept = 35, linetype=2, color='red') + geom_vline(xintercept = 0, linetype=2, color='blue')
+```
+
+#### Work
+标准误差集群：type
+
+
+```{r}
+#| label: work_level regression
+#| warning: false
+
+# 设定被省略的因子
+df_work <- within(df_work , cutt <- relevel(cutt, ref = "(20,25]"))
+
+t_fe_work <- felm(log_visit ~ cutt + tp + wind + rhum + sp + tcc + holidays +aqi + blh      #   covariates |
+                        |id + hour + month + dow
+                        | 0 |type,
+                      data = df_work, na.action="na.omit")
+summary(t_fe_work)
+base_work <- felmCoeff(t_fe_work,var = "cutt", omit = c(20, 25)) %>%
+  select(coef,se, star, xmid, range, semin, semax)
+
+# t_fe_work <- feols(log_visit ~ cutt + tp + wind + rhum + sp + tcc + holidays
+#                                  |type + hour + month + dow,
+#                                   data = df_work)
+# t_fe_work
+
+t_work.p <-binned.plot(felm.est =t_fe_work ,
+                  plotvar = "cutt",
+                  breaks = 5,
+                  omit = c(20, 25),
+                  xlimit = c(-10,40),
+                  ylimit = c(-30,10),
+                  panel = "b",
+                  group = "Workplaces",
+                  xlabel = "hourly Temp. in ℃",
+                  ylabel = "Percentage change in visits (%)"
+)
+t_work.p
+
+
+```
+
+#### Recreation
+标准误差集群：type
+
+```{r}
+#| label: recreation_level regression
+#| warning: false
+#
+# 设定被省略的因子
+df_recre <- within(df_recre , cutt <- relevel(cutt, ref = "(20,25]"))
+
+t_fe_recre <- felm(log_visit ~ cutt + tp + wind + rhum + sp + tcc + holidays +aqi+blh        #   covariates |
+                        |id + hour + month + dow
+                        | 0 |type,
+                      data = df_recre, na.action="na.omit")
+summary(t_fe_recre)
+base_recre <- felmCoeff(t_fe_recre,var = "cutt", omit = c(20, 25)) %>%
+    select(coef,se, star, xmid, range, semin, semax)
+
+# t_fe_recre <- feols(log10(cases) ~ cutt + tp + wind + rhum + sp + tcc + holidays
+#                    |type ^ month(time) ^ hour(time) ^ dow,
+#                    data = df_recre, na.action("omit"))
+# t_fe_recre
+
+t_recre.p <-binned.plot(felm.est =t_fe_recre ,
+                  plotvar = "cutt",
+                  breaks = 5,
+                  omit = c(20, 25),
+                  xlimit = c(-10,40),
+                  ylimit = c(-30,10),
+                  panel = "c", 
+                  group = "Recreation",
+                  xlabel = "hourly Temp. in ℃",
+                  ylabel = "Percentage change in visits (%)"
+)
+t_recre.p
+
+```
+
+#### Park
+标准误差集群：type
+
+```{r}
+#| label: park_level regression
+#| warning: false
+#天安门广场id:B000A83C1S;type:110105(城市广场)
+# 设定被省略的因子
+df_park <- within(df_park, cutt <- relevel(cutt, ref = "(20,25]"))
+
+t_fe_park <- felm(log_visit ~ cutt + tp + wind + rhum + holidays+ sp + tcc +aqi+ blh        #   covariates |
+                        |id + hour + month + dow
+                        | 0 |type,
+                      data = df_park, na.action="na.omit")
+summary(t_fe_park)
+base_park <- felmCoeff(t_fe_park,var = "cutt", omit = c(20, 25)) %>% 
+    select(coef,se, star, xmid, range, semin, semax)
+
+# t_fe_park <- feols(log10(cases) ~ cutt + tp + wind + rhum + sp + tcc + holidays 
+#                    | hour(time) ^ month(time) ^ dow ^ type,
+#                    # | type + hour(time) + month(time) + dow, 
+#                    data = df_park)
+# t_fe_park
+
+t_park.p <-binned.plot(felm.est = t_fe_park,
+                  plotvar = "cutt",
+                  breaks = 5,
+                  omit = c(20, 25),
+                  xlimit = c(-10,40),
+                  ylimit = c(-40,10),
+                  group = "Parks & Exercise",
+                  panel = "d",
+                  xlabel = "hourly Temp. in ℃",
+                  ylabel = "Percentage change in visits (%)"
+)
+t_park.p
+```
+
+```{r}
+#| label: transit_level regression
+#| warning: false
+
+
+# 设定被省略的因子
+# df_tran <- within(df_tran , cutt <- relevel(cutt, ref = "(15,20]"))
+# 
+# t_fe_tran<- felm(log_visit ~ cutt + tp + wind + rhum + sp + tcc + holidays +aqi        #   covariates |
+#                         |id + hour + month + dow
+#                         | 0 |type,
+#                       data = df_tran, na.action="na.omit")
+# summary(t_fe_tran)
+# felmCoeff(t_fe_tran,var = "cutt", omit = c(15, 20)) %>% 
+#     select(coef, range, semin, semax)
+# # t_fe_tran <- feols(log10(cases) ~ cutt + tp + wind + rhum + sp + tcc + holidays
+# #                      | type ^ dow ^ hour(time) + month(time),
+# #                    # | type ^ dow ^ month(time) + hour(time),
+# #                    data = df_tran, na.action("omit"))
+# # t_fe_tran
+# 
+# t_tran.p <-binned.plot(felm.est =t_fe_tran ,
+#                   plotvar = "cutt",
+#                   breaks = 5,
+#                   omit = c(15, 20),
+#                   xlimit = c(-10,40),
+#                   ylimit = c(-30,15),
+#                   panel = "5",
+#                   xlabel = "hourly Temp. in ℃",
+#                   ylabel = "Percentage change in visits (%)"
+# )
+# t_tran.p
+
+```
+
+```{r}
+#| label: live_level regression
+#| warning: false
+#| eval: false
+
+# 设定被省略的因子
+df_shop <- within(df_shop , cutt <- relevel(cutt, ref = "(10,15]"))
+
+t_fe_shop<- felm(log_visit ~ cutt + tp + wind + rhum + sp + tcc + holidays +aqi+blh       #   covariates |
+                        |id + hour + month + dow
+                        | 0 |type,
+                      data = df_shop, na.action="na.omit")
+summary(t_fe_shop)
+felmCoeff(t_fe_shop,var = "cutt", omit = c(10, 15)) %>% 
+    select(coef, range, semin, semax)
+
+# t_fe_live <- feols(log10(cases) ~ cutt + tp + wind + rhum + sp + tcc + holidays
+#                    |type ^ hour(time) ^ month(time) ^ type,
+#                    data = df_live, na.action("omit"))
+# t_fe_live
+
+t_shop.p <-binned.plot(felm.est =t_fe_shop,
+                  plotvar = "cutt",
+                  breaks = 5,
+                  omit = c(10, 15),
+                  xlimit = c(-10,40),
+                  ylimit = c(-10,10),
+                  panel = "6",
+                  xlabel = "hourly Temp. in ℃",
+                  ylabel = "Percentage change in visits (%)"
+)
+t_shop.p
+
+```
+
+
+```{r}
+#| label: test regression
+#| warning: false
+#| eval: false
+
+# 设定被省略的因子
+test <- within(test , cutt <- relevel(cutt, ref = "(20,25]"))
+# 
+t_fe<- felm(log_visit ~ cutt + tp + wind + rhum + sp + tcc + holidays +aqi+blh        #   covariates |
+                        |id + hour + month + dow
+                        | 0 |type,
+                      data = test, na.action="na.omit")
+# # t_fe_edu <- feols(log10(cases) ~ cutt + tp + wind + rhum + sp + tcc + holidays 
+# #                    | hour(time) ^ month(time) ^ dow ^ type,
+# #                    # |type ^  month(time) ^ dow + hour(time), 
+# #                    data = df_edu, na.action("omit"))
+summary(t_fe)
+# felmCoeff(t_fe_edu,var = "cutt", omit = c(10, 15)) %>% 
+#     select(coef, range, semin, semax)
+# 
+t_fe.p <-binned.plot(felm.est =t_fe,
+                  plotvar = "cutt",
+                  breaks = 5,
+                  omit = c(20, 25),
+                  xlimit = c(-10,40),
+                  ylimit = c(-30,10),
+                  panel = "7",
+                  xlabel = "",
+                  ylabel = ""
+)
+t_fe.p
+
+```
+#### Traffic
+```{r}
+#| label: traffic_level regression
+df_traf <- within(df_traf, cutt <- relevel(cutt, ref = "(20,25]"))
+
+t_fe_traf <- felm(log_visit ~ cutt + tp + wind + rhum + holidays+ sp + tcc +aqi+ blh        #   covariates |
+                        |id + hour + month + dow
+                        | 0 |id,
+                      data = df_traf, na.action="na.omit")
+summary(t_fe_traf)
+base_traf <- felmCoeff(t_fe_traf,var = "cutt", omit = c(20, 25)) %>% 
+    select(coef,se, star, xmid, range, semin, semax)
+
+# t_fe_park <- feols(log10(cases) ~ cutt + tp + wind + rhum + sp + tcc + holidays 
+#                    | hour(time) ^ month(time) ^ dow ^ type,
+#                    # | type + hour(time) + month(time) + dow, 
+#                    data = df_park)
+# t_fe_park
+
+t_traf.p <-binned.plot(felm.est = t_fe_traf,
+                  plotvar = "cutt",
+                  breaks = 5,
+                  omit = c(20, 25),
+                  xlimit = c(-10,40),
+                  ylimit = c(-30,10),
+                  group = "Traffic",
+                  panel = "e",
+                  xlabel = "hourly Temp. in ℃",
+                  ylabel = "Percentage change in visits (%)"
+)
+t_traf.p
+
+```
+
+#### Medical
+标准误差集群：type
+
+```{r}
+#| label: medical_level regression
+# 设定被省略的因子
+df_medical <- within(df_medical , cutt <- relevel(cutt, ref = "(20,25]"))
+
+t_fe_medical<- felm(log_visit ~ cutt + tp + wind + rhum + sp + tcc + holidays +aqi+blh       #   covariates |
+                        |id + hour + month + dow
+                        | 0 |type,
+                      data = df_medical, na.action="na.omit")
+summary(t_fe_medical)
+base_medical <- felmCoeff(t_fe_medical,var = "cutt", omit = c(20, 25)) %>%
+    select(coef,se, star, xmid, range, semin, semax)
+
+# t_fe_medical <- feols(log10(cases) ~ cutt + tp + wind + rhum + sp + tcc + holidays
+#                    | type ^ hour(time) ^ dow + month(time),
+#                     data = df_medical, na.action("omit"))
+# t_fe_medical
+
+t_medical.p <-binned.plot(felm.est =t_fe_medical ,
+                  plotvar = "cutt",
+                  breaks = 5,
+                  omit = c(20, 25),
+                  xlimit = c(-10,40),
+                  ylimit = c(-30,10),
+                  panel = "e",
+                  group = "Medical",
+                  xlabel = "hourly Temp. in ℃",
+                  ylabel = "Percentage change in visits (%)"
+)
+t_medical.p
+
+```
+
+
+
+
+## 结果分析
+```{r}
+#| label: analysis
+#| eval: false
+
+
+box_summary <- function(dt){
+  dt <- df[is.na(cutt) == 0]
+  
+hour.p <- dt %>%
+ggplot(mapping = aes(x = cutt)) +
+  geom_boxplot(mapping = aes(y = hour), colour = 2, na.rm = T)
+
+month.p <- dt %>%
+ggplot(mapping = aes(x = cutt)) +
+  geom_boxplot(mapping = aes(y = month), colour = 2, na.rm = T)
+
+tp.p <- dt %>%
+ggplot(mapping = aes(x = cutt)) +
+  geom_boxplot(mapping = aes(y = tp), colour = 2, na.rm = T)
+
+wind.p <- dt %>%
+ggplot(mapping = aes(x = cutt)) +
+  geom_boxplot(mapping = aes(y = wind), colour = 2, na.rm = T)
+
+rhum.p <- dt %>%
+ggplot(mapping = aes(x = cutt)) +
+  geom_boxplot(mapping = aes(y = rhum), colour = 2, na.rm = T)
+
+visit.p <- dt %>% 
+ggplot(mapping = aes(x = cutt)) +
+  geom_boxplot(mapping = aes(y = visits), colour = 2, na.rm = T)
+
+
+grid.arrange(hour.p, month.p, tp.p, wind.p, rhum.p, visit.p, nrow = 3, ncol = 2)
+
+}
+
+box_summary(df_resid)
+box_summary(df_work)
+box_summary(df_recre)
+box_summary(df_park)
+box_summary(df_tran)
+box_summary(df_shop)
+box_summary(df_edu)
+box_summary(df_medical)
+
+
+grid.arrange(t_resid.p, t_work.p, t_recre.p, t_park.p, t_medical.p,
+             nrow = 3,
+             # top = textGrob("Title", gp=gpar(fontsize=20)),
+             left = textGrob("Percentage change in visits (%)", rot=90),
+             bottom = textGrob("hourly Temp. in ℃")
+             # layout_matrix = rbind(c(1, 2),
+             #                       c(3, 4),
+             #                       c(NA, 5))
+             )
+
+
+```
+
+
+<!-- #### 集中展示 -->
+<!-- 红色 : 居住地点 -->
+<!-- 深蓝色 ：工作地点 -->
+<!-- 浅蓝色：文化娱乐地点 -->
+<!-- 黑色 ：公园 -->
+<!-- 黄色：交通运输地点 -->
+<!-- 橙色：生活服务地点 -->
+<!-- 绿色：教育服务地点 -->
+<!-- 紫色：特种服务地点 -->
+
+
+```{r}
+#| label: grid_plot
+# grid.arrange(t_resid.p, t_work.p, t_recre.p, t_park.p, t_tran.p, t_live.p, t_edu.p, t_iness.p ,nrow = 4, ncol = 2)
+
+# bin_dt <- function(dt, breaks){
+#   dt <- dt[, .(cutt, cases)]
+#   dt[, cutt := gsub("\\(|]", "", cutt)]
+#   dt[, cutt := tstrsplit(cutt, ',')[2]]
+#   dt[, cutt := as.numeric(cutt)]
+#   dt[, xmin := cutt - breaks]
+#   dt[, xmax := cutt]
+#   dt[, cutt := NULL]
+#   dt <- dt[!is.na(cases)]
+#   dt[, xmid := (xmax + xmin)/2]
+#   dt <- dt[, .(sum_cases = sum(cases)), keyby = xmid]
+#   # dt[, cases.lag := data.table::shift(sum_cases, type="lag")]
+#   # dt[is.na(cases.lag), cases.lag := sum_cases]
+#   # dt[, change := sum_cases - cases.lag]
+#   # dt <- dt[, .(xmid, change)]
+# }
+# 
+# # change = 后一个温度箱的类别总和 - 前一个温度区间的访问量综合,控制样本量为：1e6
+# ggplot(mapping = aes(xmid, sum_cases)) +
+#   geom_line(data = as.data.frame(bin_dt(sample_n(df_resid, 1e6), breaks = 5)), colour = "red") +
+#   geom_line(data = as.data.frame(bin_dt(sample_n(df_work, 1e6), breaks = 5)), colour = "blue") +
+#   geom_line(data = as.data.frame(bin_dt(sample_n(df_recre, 1e6), breaks = 5)), colour = "#2E9FDF") +
+#   geom_line(data = as.data.frame(bin_dt(sample_n(df_park, 1e6), breaks = 5)), colour = "black") +
+#   geom_line(data = as.data.frame(bin_dt(sample_n(df_tran, 1e6), breaks = 5)), colour = "yellow") +
+#   geom_line(data = as.data.frame(bin_dt(sample_n(df_live, 1e6), breaks = 5)), colour = "orange") +
+#   geom_line(data = as.data.frame(bin_dt(sample_n(df_edu, 1e6), breaks = 5)), colour = "green2") +
+#   geom_line(data = as.data.frame(bin_dt(sample_n(df_iness, 1e6), breaks = 5)), colour = "purple")
+#   
+```
+### 极端高温时，各类访问地访问量相对变化趋势
+#### hourly
+极端高温事件定义为：北京市内某小时平均温度 > 35℃，则称该小时内正在经历极端高温事件
+
+以5月18日 - 5月 20日这段时间的极端高温天气时间为例进行研究
+
+将非极端事件影响下的各类功能地点的每小时访问量的均值作为基准值，计算研究时区内的访问量的相对变化率
+
+```{r}
+#| label: relative_change hourly
+#| warning: false
+#| eval: false
+
+plot1 <- function(dt){
+  dt <- dt %>% mutate(extre_heat = ifelse(havg_heat >= 35, 1, 0))
+  dt <-  relative_change(dt)
+  plot <- plot_change(dt[time > ymd(20170518) & time < ymd(20170521)])
+  return(plot)
+}
+
+# df <- df[, avg_heat := mean(t), keyby = time] %>%
+#   mutate(extre_heat = ifelse(avg_heat >= 35, 1, 0))
+
+resid.p <- plot1(df_resid)
+resid.p
+
+work.p <- plot1(df_work)
+work.p
+
+recre.p <- plot1(df_recre)
+recre.p
+
+park.p <- plot1(df_park)
+park.p
+
+tran.p <- plot1(df_tran)
+tran.p
+
+shop.p <- plot1(df_shop)
+shop.p
+
+# edu.p <- plot1(df_edu)
+# edu.p
+
+medical.p <- plot1(df_medical)
+medical.p
+
+
+# grid.arrange(resid.p, work.p, recre.p, park.p, tran.p, live.p, edu.p, iness.p ,nrow = 4, ncol = 2)
+```
+#### t.mean_daily
+极端高温事件定义为：北京市某日平均温度 > 30℃，则称该日内正在经历极端高温事件
+
+以6月15日 - 7月 14日这段时间的极端高温天气时间为例进行研究
+
+将非极端事件影响下的各类功能地点的每日访问量的均值作为基准值，计算研究时区内的访问量的相对变化率
+
+
+```{r}
+#| label: relative change t.mean daily
+#| warning: false
+#| eval: false
+# df <- df[, avg_heat := mean(t), keyby = as.Date(time)] %>%
+#   mutate(extre_heat = ifelse(avg_heat >= 30, 1, 0))
+plot2 <- function(dt){
+  dt <- dt %>% mutate(extre_heat = ifelse(davg_heat >= 30, 1, 0))
+  dt <-  relative_dchange(dt)
+  plot <- plot_dchange(dt[time > ymd(20170615) & time < ymd(20170714)])
+  return(plot)
+}
+
+residd.p <- plot2(df_resid)
+residd.p
+
+workd.p <- plot2(df_work)
+workd.p
+
+recred.p <- plot2(df_recre)
+recred.p
+
+parkd.p <- plot2(df_park)
+parkd.p
+
+trand.p <- plot2(df_tran)
+trand.p
+
+shopd.p <- plot2(df_shop)
+shopd.p
+
+# edudd.p <- plot2(df_edu)
+# edudd.p
+
+medicald.p <- plot2(df_medical)
+medicald.p
+
+
+
+
+
+```
+#### t.max_daily
+极端高温事件定义为：北京市某日最高温度 > 35℃，则称该日内正在经历极端高温事件
+
+以5月18日 - 8月5日这段时间的极端高温天气时间为例进行研究
+
+将非极端事件影响下的各类功能地点的每日访问量的均值作为基准值，计算研究时区内的访问量的相对变化率
+
+```{r}
+#| label: relative change t.max daily
+#| warning: false
+#| eval: false
+# df <- df[, max_heat := max(t), keyby = as.Date(time)] %>%
+#   mutate(extre_heat = ifelse(max_heat >= 35, 1, 0))
+plot3 <- function(dt){
+  dt <- dt %>% mutate(extre_heat = ifelse(max_heat >= 35, 1, 0))
+  dt <-  relative_dchange(dt %>% mutate(extre_heat = ifelse(max_heat >= 35, 1, 0)))
+  plot <- plot_dchange(dt[time > ymd(20170518) & time < ymd(20170805)])
+  return(plot)
+}
+
+residd2.p <- plot3(df_resid)
+residd2.p
+
+
+workd2.p <- plot3(df_work)
+workd2.p
+
+recred2.p <- plot3(df_recre)
+recred2.p
+
+parkd2.p <- plot3(df_park)
+parkd2.p
+
+trand2.p <- plot3(df_tran)
+trand2.p
+
+shopd2.p <- plot3(df_shop)
+shopd2.p
+
+# edud2.p <- plot3(df_edu)
+# edud2.p
+
+medicald2.p <- plot3(df_medical)
+medicald2.p
+
+```
+
+
+
+
+## 鲁棒性检验
+### Residential
+```{r}
+#| label: resid Robustness check
+
+#用date替换dow
+df_resid <- within(df_resid, cutt <- relevel(cutt, ref = "(20,25]"))
+
+df_resid <- df_resid %>% mutate(date = make_date(year = year, month = month, day = day))
+
+t_datefe_resid <- felm(log_visit ~ cutt + tp + wind + rhum + sp + tcc +aqi+ blh        #   covariates |
+                        |id + hour + month + date
+                        | 0 |type,
+                      data = df_resid, na.action="na.omit")
+# summary(t_datefe_resid)
+date_resid <- felmCoeff(t_datefe_resid,var = "cutt", omit = c(20, 25)) %>% 
+    select(coef, xmid)
+
+#用season替换month
+
+df_resid <- season(df_resid)
+
+df_resid <- within(df_resid, cutt <- relevel(cutt, ref = "(20,25]"))
+
+t_seasonfe_resid <- felm(log_visit ~ cutt + tp + wind + rhum + sp + tcc + holidays + aqi+ blh        #   covariates |
+                        |id + hour + season + dow
+                        | 0 |type,
+                      data = df_resid, na.action="na.omit")
+# summary(t_seasonfe_resid)
+season_resid <- felmCoeff(t_seasonfe_resid,var = "cutt", omit = c(20, 25)) %>% 
+    select(coef, xmid)
+
+#3℃ bin
+cutt_levels2 <- c("(-9,-6]", "(-6,-3]", "(-3,0]", "(0,3]", "(3,6]", "(6,9]", "(9,12]", "(12,15]", "(15,18]","(18,21]", "(21,24]", "(24,27]", "(27,30]", "(30,33]", "(33,36]", "(36,39]")
+df_resid <- df_resid %>% mutate(cutt2 = factor(cut(t, breaks = c(seq(from = -9, to = 39, by = 3))), levels = cutt_levels2))
+
+df_resid <- within(df_resid, cutt2 <- relevel(cutt2, ref = "(21,24]"))
+
+t2_fe_resid <- felm(log_visit ~ cutt2 + tp + wind + rhum + holidays+ sp + tcc +aqi+ blh        #   covariates |
+                        |id + hour + month + dow
+                        | 0 |type,
+                      data = df_resid, na.action="na.omit")
+# summary(t2_fe_resid)
+bin3_resid <- felmCoeff(t2_fe_resid,var = "cutt2", omit = c(21, 24)) %>% 
+    select(coef, xmid)
+
+
+#plot Robustness
+
+label_resid <- rbind.data.frame(
+  base_resid %>% filter(xmid == min(xmid)) %>% select(coef, xmid), 
+  date_resid %>% filter(xmid == min(xmid)), 
+  season_resid %>% filter(xmid == min(xmid)), 
+  bin3_resid %>% filter(xmid == min(xmid))
+  )
+label_resid$label = c("(1)", "(2)", "(3)", "(4)")
+  
+t_resid.p + 
+  geom_line(data=date_resid, aes(x=xmid, y=coef * 100), color="#02263e", linewidth=1, alpha=1) +
+  geom_line(data=season_resid, aes(x=xmid, y=coef * 100), color="#ef4143", linewidth=1, alpha=1) +
+  geom_line(data=bin3_resid, aes(x=xmid, y=coef * 100), color="#bf1e2e", linewidth=1, alpha=1) +
+  geom_vline(xintercept = 35, linetype=2, color='red') + geom_vline(xintercept = 0, linetype=2, color='blue')+
+  geom_text(
+    aes(x = xmid, y = coef*100, label = label),
+    data = label_resid,
+    hjust = "right",
+    vjust = "center")
+```
+
+### Work
+```{r}
+#| label: park Robustness check
+
+#用date替换dow
+df_work <- within(df_work, cutt <- relevel(cutt, ref = "(20,25]"))
+
+df_work <- df_work %>% mutate(date = make_date(year = year, month = month, day = day))
+
+t_datefe_work <- felm(log_visit ~ cutt + tp + wind + rhum + sp + tcc + aqi + blh        #   covariates |
+                        |id + hour + date + month
+                        | 0 |type,
+                      data = df_work, na.action="na.omit")
+summary(t_datefe_work)
+date_work <- felmCoeff(t_datefe_work,var = "cutt", omit = c(20, 25)) %>% 
+    select(coef, xmid)
+
+#用season替换month
+
+df_work <- season(df_work)
+
+df_work <- within(df_work, cutt <- relevel(cutt, ref = "(20,25]"))
+
+t_seasonfe_work <- felm(log_visit ~ cutt + tp + wind + rhum + sp + tcc + holidays + aqi+ blh        #   covariates |
+                        |id + hour + season + dow
+                        | 0 |type,
+                      data = df_work, na.action="na.omit")
+# summary(t_seasonfe_work)
+season_work <- felmCoeff(t_seasonfe_work,var = "cutt", omit = c(20, 25)) %>% 
+    select(coef, xmid)
+
+#3℃ bin
+cutt_levels2 <- c("(-9,-6]", "(-6,-3]", "(-3,0]", "(0,3]", "(3,6]", "(6,9]", "(9,12]", "(12,15]", "(15,18]","(18,21]", "(21,24]", "(24,27]", "(27,30]", "(30,33]", "(33,36]", "(36,39]")
+df_work <- df_work %>% mutate(cutt2 = factor(cut(t, breaks = c(seq(from = -9, to = 39, by = 3))), levels = cutt_levels2))
+
+df_work <- within(df_work, cutt2 <- relevel(cutt2, ref = "(21,24]"))
+
+t2_fe_work <- felm(log_visit ~ cutt2 + tp + wind + rhum + holidays+ sp + tcc +aqi+ blh        #   covariates |
+                        |id + hour + month + dow
+                        | 0 |type,
+                      data = df_work, na.action="na.omit")
+# summary(t2_fe_work)
+bin3_work <- felmCoeff(t2_fe_work,var = "cutt2", omit = c(21, 24)) %>% 
+    select(coef, xmid)
+
+
+#plot Robustness
+
+label_work <- rbind.data.frame(
+  base_work %>% filter(xmid == min(xmid)) %>% select(coef, xmid), 
+  date_work %>% filter(xmid == min(xmid)), 
+  season_work %>% filter(xmid == min(xmid)), 
+  bin3_work %>% filter(xmid == min(xmid))
+  )
+label_work$label = c("(1)", "(2)", "(3)", "(4)")
+  
+t_work.p + 
+  geom_line(data=date_work, aes(x=xmid, y=coef * 100), color="#02263e", linewidth=1, alpha=1) +
+  geom_line(data=season_work, aes(x=xmid, y=coef * 100), color="#ef4143", linewidth=1, alpha=1) +
+  geom_line(data=bin3_work, aes(x=xmid, y=coef * 100), color="#bf1e2e", linewidth=1, alpha=1) +
+  geom_vline(xintercept = 35, linetype=2, color='red') + geom_vline(xintercept = 0, linetype=2, color='blue')+
+  geom_text(
+    aes(x = xmid, y = coef*100, label = label),
+    data = label_work,
+    hjust = "right",
+    vjust = "center")
+
+```
+
+### Recreation
+```{r}
+#| label: park Robustness check
+
+#用date替换dow
+df_recre <- within(df_recre, cutt <- relevel(cutt, ref = "(20,25]"))
+
+df_recre <- df_recre %>% mutate(date = make_date(year = year, month = month, day = day))
+
+t_datefe_recre <- felm(log_visit ~ cutt + tp + wind + rhum + sp + tcc +aqi+ blh        #   covariates |
+                        |id + hour + month + date
+                        | 0 |type,
+                      data = df_recre, na.action="na.omit")
+# summary(t_datefe_recre)
+date_recre <- felmCoeff(t_datefe_recre,var = "cutt", omit = c(20, 25)) %>% 
+    select(coef, xmid)
+
+#用season替换month
+
+df_recre$season<-4
+df_recre$season[df_recre$month >= 9 & df_recre$month <= 11]<-3
+df_recre$season[df_recre$month >= 6 & df_recre$month <= 8]<-2
+df_recre$season[df_recre$month >= 3 & df_recre$month <= 5]<-1
+
+df_recre <- within(df_recre, cutt <- relevel(cutt, ref = "(20,25]"))
+
+t_seasonfe_recre <- felm(log_visit ~ cutt + tp + wind + rhum + sp + tcc + holidays + aqi+ blh        #   covariates |
+                        |id + hour + season + dow
+                        | 0 |type,
+                      data = df_recre, na.action="na.omit")
+summary(t_seasonfe_recre)
+season_recre <- felmCoeff(t_seasonfe_recre,var = "cutt", omit = c(20, 25)) %>% 
+    select(coef, xmid)
+
+#3℃ bin
+cutt_levels2 <- c("(-9,-6]", "(-6,-3]", "(-3,0]", "(0,3]", "(3,6]", "(6,9]", "(9,12]", "(12,15]", "(15,18]","(18,21]", "(21,24]", "(24,27]", "(27,30]", "(30,33]", "(33,36]", "(36,39]")
+df_recre <- df_recre %>% mutate(cutt2 = factor(cut(t, breaks = c(seq(from = -9, to = 39, by = 3))), levels = cutt_levels2))
+
+df_recre <- within(df_recre, cutt2 <- relevel(cutt2, ref = "(21,24]"))
+
+t2_fe_recre <- felm(log_visit ~ cutt2 + tp + wind + rhum + holidays+ sp + tcc +aqi+ blh        #   covariates |
+                        |id + hour + month + dow
+                        | 0 |type,
+                      data = df_recre, na.action="na.omit")
+summary(t2_fe_recre)
+bin3_recre <- felmCoeff(t2_fe_recre,var = "cutt2", omit = c(21, 24)) %>% 
+    select(coef, xmid)
+
+
+#plot Robustness
+
+label_recre <- rbind.data.frame(
+  base_recre %>% filter(xmid == min(xmid)) %>% select(coef, xmid), 
+  date_recre %>% filter(xmid == min(xmid)), 
+  season_recre %>% filter(xmid == min(xmid)), 
+  bin3_recre %>% filter(xmid == min(xmid))
+  )
+label_recre$label = c("(1)", "(2)", "(3)", "(4)")
+  
+t_recre.p + 
+  geom_line(data=date_recre, aes(x=xmid, y=coef * 100), color="#02263e", linewidth=1, alpha=1) +
+  geom_line(data=season_recre, aes(x=xmid, y=coef * 100), color="#ef4143", linewidth=1, alpha=1) +
+  geom_line(data=bin3_recre, aes(x=xmid, y=coef * 100), color="#bf1e2e", linewidth=1, alpha=1) +
+  geom_vline(xintercept = 35, linetype=2, color='red') + geom_vline(xintercept = 0, linetype=2, color='blue')+
+  geom_text(
+    aes(x = xmid, y = coef*100, label = label),
+    data = label_recre,
+    hjust = "right",
+    vjust = "center")
+
+```
+
+### park
+```{r}
+#| label: park Robustness check
+
+#用date替换dow
+df_park <- within(df_park, cutt <- relevel(cutt, ref = "(20,25]"))
+
+df_park <- df_park %>% mutate(date = make_date(year = year, month = month, day = day))
+
+t_datefe_park <- felm(log_visit ~ cutt + tp + wind + rhum + sp + tcc +aqi+ blh        #   covariates |
+                        |id + hour + month + date
+                        | 0 |type,
+                      data = df_park, na.action="na.omit")
+# summary(t_datefe_park)
+date_park <- felmCoeff(t_datefe_park,var = "cutt", omit = c(20, 25)) %>% 
+    select(coef, xmid)
+
+#用season替换month
+
+df_park <- season(df_park)
+
+df_park <- within(df_park, cutt <- relevel(cutt, ref = "(20,25]"))
+
+t_seasonfe_park <- felm(log_visit ~ cutt + tp + wind + rhum + sp + tcc + holidays + aqi+ blh        #   covariates |
+                        |id + hour + season + dow
+                        | 0 |type,
+                      data = df_park, na.action="na.omit")
+# summary(t_seasonfe_park)
+season_park <- felmCoeff(t_seasonfe_park,var = "cutt", omit = c(20, 25)) %>% 
+    select(coef, xmid)
+
+#3℃ bin
+cutt_levels2 <- c("(-9,-6]", "(-6,-3]", "(-3,0]", "(0,3]", "(3,6]", "(6,9]", "(9,12]", "(12,15]", "(15,18]","(18,21]", "(21,24]", "(24,27]", "(27,30]", "(30,33]", "(33,36]", "(36,39]")
+df_park <- df_park %>% mutate(cutt2 = factor(cut(t, breaks = c(seq(from = -9, to = 39, by = 3))), levels = cutt_levels2))
+
+df_park <- within(df_park, cutt2 <- relevel(cutt2, ref = "(21,24]"))
+
+t2_fe_park <- felm(log_visit ~ cutt2 + tp + wind + rhum + holidays+ sp + tcc +aqi+ blh        #   covariates |
+                        |id + hour + month + dow
+                        | 0 |type,
+                      data = df_park, na.action="na.omit")
+# summary(t2_fe_park)
+bin3_park <- felmCoeff(t2_fe_park,var = "cutt2", omit = c(21, 24)) %>% 
+    select(coef, xmid)
+
+
+#plot Robustness
+
+label_park <- rbind.data.frame(
+  base_park %>% filter(xmid == min(xmid)) %>% select(coef, xmid), 
+  date_park %>% filter(xmid == min(xmid)), 
+  season_park %>% filter(xmid == min(xmid)), 
+  bin3_park %>% filter(xmid == min(xmid))
+  )
+label_park$label = c("(1)", "(2)", "(3)", "(4)")
+  
+t_park.p + 
+  geom_line(data=date_park, aes(x=xmid, y=coef * 100), color="#02263e", linewidth=1, alpha=1) +
+  geom_line(data=season_park, aes(x=xmid, y=coef * 100), color="#ef4143", linewidth=1, alpha=1) +
+  geom_line(data=bin3_park, aes(x=xmid, y=coef * 100), color="#bf1e2e", linewidth=1, alpha=1) +
+  geom_vline(xintercept = 35, linetype=2, color='red') + geom_vline(xintercept = 0, linetype=2, color='blue')+
+  geom_text(
+    aes(x = xmid, y = coef*100, label = label),
+    data = label_park,
+    hjust = "right",
+    vjust = "center")
+
+```
+### Traffic
+```{r}
+#| label: traffic Robustness check
+#用date替换dow
+df_traf <- within(df_traf, cutt <- relevel(cutt, ref = "(20,25]"))
+
+df_traf <- df_traf %>% mutate(date = make_date(year = year, month = month, day = day))
+
+t_datefe_traf <- felm(log_visit ~ cutt + tp + wind + rhum + sp + tcc +aqi+ blh        #   covariates |
+                        |id + hour + month + date
+                        | 0 |id,
+                      data = df_traf, na.action="na.omit")
+# summary(t_datefe_park)
+date_traf <- felmCoeff(t_datefe_traf, var = "cutt", omit = c(20, 25)) %>% 
+    select(coef, xmid)
+
+#用season替换month
+
+df_traf <- season(df_traf)
+
+df_traf <- within(df_traf, cutt <- relevel(cutt, ref = "(20,25]"))
+
+t_seasonfe_traf <- felm(log_visit ~ cutt + tp + wind + rhum + sp + tcc + holidays + aqi+ blh        #   covariates |
+                        |id + hour + season + dow
+                        | 0 |id,
+                      data = df_traf, na.action="na.omit")
+# summary(t_seasonfe_park)
+season_traf <- felmCoeff(t_seasonfe_traf,var = "cutt", omit = c(20, 25)) %>% 
+    select(coef, xmid)
+
+#3℃ bin
+cutt_levels2 <- c("(-9,-6]", "(-6,-3]", "(-3,0]", "(0,3]", "(3,6]", "(6,9]", "(9,12]", "(12,15]", "(15,18]","(18,21]", "(21,24]", "(24,27]", "(27,30]", "(30,33]", "(33,36]", "(36,39]")
+df_traf <- df_traf %>% mutate(cutt2 = factor(cut(t, breaks = c(seq(from = -9, to = 39, by = 3))), levels = cutt_levels2))
+
+df_traf <- within(df_traf, cutt2 <- relevel(cutt2, ref = "(21,24]"))
+
+t2_fe_traf <- felm(log_visit ~ cutt2 + tp + wind + rhum + holidays+ sp + tcc +aqi+ blh        #   covariates |
+                        |id + hour + month + dow
+                        | 0 |id,
+                      data = df_traf, na.action="na.omit")
+# summary(t2_fe_park)
+bin3_traf <- felmCoeff(t2_fe_traf,var = "cutt2", omit = c(21, 24)) %>% 
+    select(coef, xmid)
+
+
+#plot Robustness
+
+label_traf <- rbind.data.frame(
+  base_traf %>% filter(xmid == min(xmid)) %>% select(coef, xmid), 
+  date_traf %>% filter(xmid == min(xmid)), 
+  season_traf %>% filter(xmid == min(xmid)), 
+  bin3_traf %>% filter(xmid == min(xmid))
+  )
+label_traf$label = c("(1)", "(2)", "(3)", "(4)")
+  
+t_traf.p + 
+  geom_line(data=date_traf, aes(x=xmid, y=coef * 100), color="#02263e", linewidth=1, alpha=1) +
+  geom_line(data=season_traf, aes(x=xmid, y=coef * 100), color="#ef4143", linewidth=1, alpha=1) +
+  geom_line(data=bin3_traf, aes(x=xmid, y=coef * 100), color="#bf1e2e", linewidth=1, alpha=1) +
+  geom_vline(xintercept = 35, linetype=2, color='red') + geom_vline(xintercept = 0, linetype=2, color='blue')+
+  geom_text(
+    aes(x = xmid, y = coef*100, label = label),
+    data = label_traf,
+    hjust = "right",
+    vjust = "center")
+
+
+```
+
+### Medical
+```{r}
+#| label: dt Robustness check
+
+#用date替换dow
+
+df_medical <- within(df_medical, cutt <- relevel(cutt, ref = "(20,25]"))
+
+df_medical <- df_medical %>% mutate(date = make_date(year = year, month = month, day = day))
+
+t_datefe_medical <- felm(log_visit ~ cutt + tp + wind + rhum + sp + tcc +aqi+ blh        #   covariates |
+                        |id + hour + month + date
+                        | 0 |type,
+                      data = df_medical, na.action="na.omit")
+summary(t_datefe_medical)
+date_medical <- felmCoeff(t_datefe_medical,var = "cutt", omit = c(20, 25)) %>% 
+    select(coef, xmid)
+
+#用season替换month
+
+df_medical$season<-4
+df_medical$season[df_medical$month >= 9 & df_medical$month <= 11]<-3
+df_medical$season[df_medical$month >= 6 & df_medical$month <= 8]<-2
+df_medical$season[df_medical$month >= 3 & df_medical$month <= 5]<-1
+
+df_medical <- within(df_medical, cutt <- relevel(cutt, ref = "(20,25]"))
+
+t_seasonfe_medical <- felm(log_visit ~ cutt + tp + wind + rhum + sp + tcc + holidays + aqi+ blh        #   covariates |
+                        |id + hour + season + dow
+                        | 0 |type,
+                      data = df_medical, na.action="na.omit")
+summary(t_seasonfe_medical)
+season_medical <- felmCoeff(t_seasonfe_medical,var = "cutt", omit = c(20, 25)) %>% 
+    select(coef, xmid)
+
+#3℃ bin
+cutt_levels2 <- c("(-9,-6]", "(-6,-3]", "(-3,0]", "(0,3]", "(3,6]", "(6,9]", "(9,12]", "(12,15]", "(15,18]","(18,21]", "(21,24]", "(24,27]", "(27,30]", "(30,33]", "(33,36]", "(36,39]")
+df_medical <- df_medical %>% mutate(cutt2 = factor(cut(t, breaks = c(seq(from = -9, to = 39, by = 3))), levels = cutt_levels2))
+
+df_medical <- within(df_medical, cutt2 <- relevel(cutt2, ref = "(21,24]"))
+
+t2_fe_medical <- felm(log_visit ~ cutt2 + tp + wind + rhum + holidays+ sp + tcc +aqi+ blh        #   covariates |
+                        |id + hour + month + dow
+                        | 0 |type,
+                      data = df_medical, na.action="na.omit")
+summary(t2_fe_medical)
+bin3_medical <- felmCoeff(t2_fe_medical,var = "cutt2", omit = c(21, 24)) %>% 
+    select(coef, xmid)
+
+
+#plot Robustness
+plot_rob <- function(base_park , date_park, season_park, bin3_park){
+  label_park <- rbind.data.frame(
+  base_park %>% filter(xmid == min(xmid)) %>% select(coef, xmid), 
+  date_park %>% filter(xmid == min(xmid)), 
+  season_park %>% filter(xmid == min(xmid)), 
+  bin3_park %>% filter(xmid == min(xmid))
+  )
+label_park$label = c("(1)", "(2)", "(3)", "(4)")
+  
+p <- t_medical.p + 
+  geom_line(data=date_park, aes(x=xmid, y=coef * 100), color="#02263e", linewidth=1, alpha=1) +
+  geom_line(data=season_park, aes(x=xmid, y=coef * 100), color="#ef4143", linewidth=1, alpha=1) +
+  geom_line(data=bin3_park, aes(x=xmid, y=coef * 100), color="#bf1e2e", linewidth=1, alpha=1) +
+  geom_vline(xintercept = 35, linetype=2, color='red') + geom_vline(xintercept = 0, linetype=2, color='blue')+
+  geom_text(
+    aes(x = xmid, y = coef*100, label = label),
+    data = label_park,
+    hjust = "right",
+    vjust = "center")
+return(p)
+}
+rob_medical <- plot_rob(base_park = base_medical, date_park = date_medical, season_park = season_medical, bin3_park = bin3_medical)
+
+```
+

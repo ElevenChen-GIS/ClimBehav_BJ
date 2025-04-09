@@ -1,0 +1,74 @@
+---
+title: "03_figure3主回归结果"
+author: "Chen Yu"
+toc: true
+number-sections: true
+date: 2024-03-05
+format: 
+  html:
+    code-fold: false
+    embed-resources: true
+    toc: true
+    toc-location: right
+editor: source
+---
+
+# Set up packages and environment
+
+```{r}
+#| label: environment
+#| include: false
+library(tidyverse)
+library(terra)       #处理栅格数据
+library(magrittr)    #提供管道操作
+library(lubridate)    #提供时间有关函数
+library(data.table)
+library(fixest)   #提供feols函数
+library(lfe)  #提供felm函数
+library(ggExtra) # for marginal histograms
+library(plyr) #for additional manipulation functions
+library(gridExtra) # for multiplots
+# library(tictoc) # measure time
+library(parallel)     #提供并行运算
+library(zoo) #提供滑动平均函数
+library(grid) #自定义常用主题
+library(cowplot) #拼图
+library(ggpubr) # for multiplots and labels
+library(ggforce) #for zoom in function
+library(scales) # for scales axis
+library(stargazer)
+
+source("~/ClimBehav_bj/results/scripts/binned_plot_function.R") # load plot function
+load("~/ClimBehav_bj/results/data/raw/01_AOI/11-北京市-aoi.Rdata") #load AOI
+load("~/ClimBehav_bj/results/data/processed/pAll.RData")
+load(file = "~/ClimBehav_bj/results/data/processed/pClass.RData")
+load(file = "~/ClimBehav_bj/results/data/processed/pStack.RData")
+
+```
+
+#plot
+```{r}
+p1 <- grid.arrange(p.double.winter,p.double.summar,nrow = 1)
+p2 <- grid.arrange(pClass[[1]], pClass[[2]], pClass[[3]], pClass[[4]], nrow = 1)
+#save as eps
+###需要在console中输入
+# 保存为eps
+# setEPS()
+cairo_ps(file = "~/ClimBehav_bj/results/plots/figure2.eps",width = 16,height = 12)
+pushViewport(viewport(layout = grid.layout(2,4)))
+print(pStack, vp = viewport(layout.pos.row = 1,layout.pos.col = 1:2))
+print(ggdraw(p1), vp = viewport(layout.pos.row = 1,layout.pos.col = 3:4))
+print(ggdraw(p2), vp = viewport(layout.pos.row = 2,layout.pos.col = 1:4))
+dev.off()
+# #save as pdf
+pdf(file = "~/ClimBehav_bj/results/plots/figure2.pdf",width = 16,height = 12)
+pushViewport(viewport(layout = grid.layout(2,4)))
+print(pStack, vp = viewport(layout.pos.row = 1,layout.pos.col = 1:2))
+print(ggdraw(p1), vp = viewport(layout.pos.row = 1,layout.pos.col = 3:4))
+print(ggdraw(p2), vp = viewport(layout.pos.row = 2,layout.pos.col = 1:4))
+dev.off()
+# pJoin <- ggarrange(p1, p2, nrow = 2,labels = c("a","b"))
+# ggsave("~/ClimBehav_bj/results/plots/figure2.pdf",plot = pJoin, device = cairo_pdf, width =16, height =12)
+# ggsave("~/ClimBehav_bj/results/plots/figure2.eps",plot = pJoin, device = "eps", width =16, height =12)
+```
+

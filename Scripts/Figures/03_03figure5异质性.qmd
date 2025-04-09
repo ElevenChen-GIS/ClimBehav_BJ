@@ -1,0 +1,291 @@
+---
+title: "异质性探究"
+author: "Yu Chen"
+date: 2024-01-11
+format: 
+  html:
+    code-fold: false
+    embed-resources: true
+    toc: true
+    toc-location: right
+---
+```{r}
+#| label: backgroud
+library(data.table)
+library(tidyverse)
+library(ggplot2)
+library(sf)
+library(sfheaders)
+# library(mapchina)
+library(plyr) #for additional manipulation functions
+# library(tictoc) # measure time
+library(ggpubr)
+library(grid) #自定义常用主题
+
+load("~/ClimBehav_bj/results/data/raw/01_AOI/11-北京市-aoi.Rdata")
+load("~/ClimBehav_bj/results/data/processed/pHeter.RData")
+point_urban <- fread(file = "~/ClimBehav_bj/results/data/processed/heteData.csv")
+fangjia <- fread(file = "~/ClimBehav_bj/results/data/processed/income.csv")
+
+threshold <- function(dt, a){
+  visit.stat <- dt %>% group_by(id) %>% dplyr::summarise(daily_visit_num = sum(visits / 365, na.rm = T))
+  base_select <- filter(visit.stat, daily_visit_num >= a)
+  dt <- dt %>%
+    dplyr::filter(id %in% base_select$id)
+  return(dt)
+}
+bootstrapCI <- function(n,a,b){
+  y = NULL
+  delta <- replicate(1000,expr = {
+  rnorm(n, a, b)})
+  for (i in 1:nrow(delta)) {
+    y <- rbind(y, as.numeric(quantile(delta[i,],c(.025,.975))))
+  }
+  return(list(y[,1],y[,2]))
+}
+```
+
+#data preperation
+```{r}
+#分类定义
+workLiveLabel <- c("Residential", "Park", "Transport", "Work")
+classColor <- c("Residential" = "#e4cb8e","Park" = "#1a7e76","Transport" = "#a9ddd5","Work" = "#94580f")
+high_holiday$holiday <- high_holiday$holiday %>% 
+  factor() %>% 
+  revalue(c("1" = "Weekdays/\nHolidays","0"="Workdays")) %>% 
+  factor(labels = c("Workdays","Weekdays/\nHolidays"))
+
+high_urban$urban <- high_urban$urban %>% 
+  revalue(c("1" = "Urban","0"="Rural")) %>% 
+  factor(labels = c("Rural","Urban"))
+
+high_income$income <- high_income$income %>% 
+  revalue(c("1" = "High","0"="Low")) %>% 
+  factor(labels = c("Low","High"))
+high_income <- high_income %>% as.data.table()
+
+#bootstrap error
+high_holiday[,c("semin","semax") := bootstrapCI(16,coef, se)]
+high_urban[,c("semin","semax") := bootstrapCI(16,coef, se)]
+high_income[,c("semin","semax") := bootstrapCI(16,coef, se)]
+```
+#heterogeneity
+##Chow test
+```{r}
+holiday.dif<- data.table(
+  x = rep(workLiveLabel,2),
+  y = rep(0.1,8),
+  label = c("NS","NS","NS","NS",
+            "NS","*","*","NS"),
+  t = c(rep(0,4),rep(35,4))
+)
+urban.dif<- data.table(
+  x = rep(workLiveLabel,2),
+  y = rep(0.1,8),
+  label = c("***","**","**","***",
+            "**","NA","**","***"),
+  t = c(rep(0,4),rep(35,4))
+)
+income.dif<- data.table(
+  x = rep(workLiveLabel,2),
+  y = rep(0.1,8),
+  label = c("***","***","**","**",
+            "***","**","**","***"),
+  t = c(rep(0,4),rep(35,4))
+)
+# holiday.l <- data.table(
+#   x = workLiveLabel,
+#   y = c(0.06,rep(0.08,2),0.06),
+#   holiday = c(rep("Workdays",2),rep("Weekdays/\nHolidays",2))
+# )
+```
+##holiday
+```{r}
+holiday.p <- NULL
+
+#significant line
+# sig_holiday <- data.table()
+
+holiday.p[[1]] <- high_holiday[xmin == 35] %>% 
+  ggplot(aes(x=class,y=coef,fill = holiday))+
+    geom_hline(aes(yintercept=0), linetype=1, color='black') +
+    geom_bar(position="dodge", stat="identity",width=0.6) +
+    geom_errorbar(mapping=aes(ymin=semin,ymax=semax), width=0.2, color="black",linewidth=.3, position = position_dodge(0.6)) +
+    # geom_point(data = holiday.dif[t==0],aes())+
+    geom_text(data = holiday.dif[t==35],aes(x,y,label =label,fill = NULL),size = 3)+
+    # geom_line(data = holiday.l,aes(x,y,fill = holiday))+
+    scale_fill_manual(values = c("#D3e1ae","#eea2a4")) +
+    scale_color_manual(values = c("#D3e1ae","#eea2a4")) +
+    ylab(expression(paste("Margin Effect of >35", degree, C))) +
+    coord_cartesian(ylim=c(-0.65,0.1)) +
+    # annotate('text',x=0.5,y=0.05,label="***",
+    #          size=8,color='black')+
+    # theme_bw()+
+    theme(legend.position = "none",
+          axis.title.x = element_text(size=7, angle=0, vjust=1.1),
+          axis.title.y = element_text(size=7, angle=90, vjust=-0),
+          axis.text.y = element_text(size=6, angle=0),
+          axis.text.x = element_text(size=6),
+          legend.text = element_text(size=6),
+          legend.title = element_text(size=7),
+          legend.key.size = unit(5, "mm"),
+          # panel.grid.major = element_blank(),
+          axis.line.x = element_line(),
+          axis.line.y = element_line(),
+          panel.background = element_blank())
+
+holiday.p[[2]] <- high_holiday[xmin == -5] %>% 
+  ggplot(aes(x=class,y=coef,fill = holiday))+
+    geom_hline(aes(yintercept=0), linetype=1, color='black') +
+    geom_bar(position="dodge", stat="identity",width=0.6) +
+    geom_errorbar(mapping=aes(ymin=semin,ymax=semax), width=0.2, color="black",linewidth=.3, position = position_dodge(0.6)) +
+    # geom_point(data = holiday.dif[t==0],aes())+
+    geom_text(data = holiday.dif[t==0],aes(x,y,label =label,fill = NULL),size = 3)+
+    # geom_line(data = holiday.l,aes(x,y,fill = holiday))+
+    scale_fill_manual(values = c("#D3e1ae","#eea2a4")) +
+    scale_color_manual(values = c("#D3e1ae","#eea2a4")) +
+    ylab(expression(paste("Margin Effect of <0", degree, C))) +
+    coord_cartesian(ylim=c(-0.65,0.1)) +
+    # annotate('text',x=0.5,y=0.05,label="***",
+    #          size=8,color='black')+
+    # theme_bw()+
+    theme(legend.position = "none",
+          axis.title.x = element_text(size=7, angle=0, vjust=1.1),
+          axis.title.y = element_text(size=7, angle=90, vjust=-0),
+          axis.text.y = element_text(size=6, angle=0),
+          axis.text.x = element_text(size=6),
+          legend.text = element_text(size=6),
+          legend.title = element_text(size=7),
+          legend.key.size = unit(5, "mm"),
+          # panel.grid.major = element_blank(),
+          axis.line.x = element_line(),
+          axis.line.y = element_line(),
+          panel.background = element_blank())
+```
+
+##urban
+```{r}
+urban.p <- NULL
+
+urban.p[[1]] <- high_urban[xmin == 35] %>% 
+  ggplot(aes(x=class,y=coef,fill = urban))+
+    geom_bar(color = "#F0FFFF", position="dodge", stat="identity",width=0.6) +
+    geom_hline(aes(yintercept=0), linetype=1, color='black') +
+    geom_bar(position="dodge", stat="identity",width=0.6) +
+    geom_errorbar(mapping=aes(ymin=semin,ymax=semax), width=0.2, color="black",linewidth=.3, position = position_dodge(0.6)) +
+    geom_text(data = urban.dif[t==35],aes(x,y,label =label,fill = NULL),size = 3)+
+    scale_fill_manual(values = c("#D3e1ae","#eea2a4")) +
+    scale_color_manual(values = c("#D3e1ae","#eea2a4")) +
+    ylab(expression(paste("Margin Effect of >35", degree, C))) +
+    coord_cartesian(ylim=c(-0.6,0.1)) +
+    theme(legend.position = "none",
+          axis.title.x = element_text(size=7, angle=0, vjust=1.1),
+          axis.title.y = element_text(size=7, angle=90, vjust=-0),
+          axis.text.y = element_text(size=6, angle=0),
+          axis.text.x = element_text(size=6),
+          legend.text = element_text(size=6),
+          legend.title = element_text(size=7),
+          legend.key.size = unit(5, "mm"),
+          # panel.grid.major = element_blank(),
+          axis.line.x = element_line(),
+          axis.line.y = element_line(),
+          panel.background = element_blank())
+
+urban.p[[2]] <- high_urban[xmin == -5] %>% 
+  ggplot(aes(x=class,y=coef,fill = urban))+
+    geom_bar(color = "#F0FFFF", position="dodge", stat="identity",width=0.6) +
+    geom_hline(aes(yintercept=0), linetype=1, color='black') +
+    geom_bar(position="dodge", stat="identity",width=0.6) +
+    geom_errorbar(mapping=aes(ymin=semin,ymax=semax), width=0.2, color="black",linewidth=.3, position = position_dodge(0.6)) +
+    geom_text(data = urban.dif[t==0],aes(x,y,label =label,fill = NULL),size = 3)+
+    scale_fill_manual(values = c("#D3e1ae","#eea2a4")) +
+    scale_color_manual(values = c("#D3e1ae","#eea2a4")) +
+    ylab(expression(paste("Margin Effect of <0", degree, C))) +
+    coord_cartesian(ylim=c(-0.6,0.1)) +
+    theme(legend.position = "none",
+          axis.title.x = element_text(size=7, angle=0, vjust=1.1),
+          axis.title.y = element_text(size=7, angle=90, vjust=-0),
+          axis.text.y = element_text(size=6, angle=0),
+          axis.text.x = element_text(size=6),
+          legend.text = element_text(size=6),
+          legend.title = element_text(size=7),
+          legend.key.size = unit(5, "mm"),
+          # panel.grid.major = element_blank(),
+          axis.line.x = element_line(),
+          axis.line.y = element_line(),
+          panel.background = element_blank())
+```
+
+##income
+```{r}
+income.p <- NULL
+
+income.p[[1]] <- high_income[xmin == 35] %>% 
+  ggplot(aes(x=class,y=coef,fill = income))+
+    geom_bar(color = "#F0FFFF", position="dodge", stat="identity",width=0.6) +
+    geom_hline(aes(yintercept=0), linetype=1, color='black') +
+    geom_bar(position="dodge", stat="identity",width=0.6) +
+    geom_errorbar(mapping=aes(ymin=semin,ymax=semax), width=0.2, color="black",linewidth=.3, position = position_dodge(0.6)) +
+    geom_text(data = income.dif[t==35],aes(x,y,label =label,fill = NULL),size = 3)+
+    scale_fill_manual(values = c("#D3e1ae","#eea2a4")) +
+    scale_color_manual(values = c("#D3e1ae","#eea2a4")) +
+    ylab(expression(paste("Margin Effect of >35", degree, C))) +
+    coord_cartesian(ylim=c(-0.55,0.1)) +
+    theme(legend.position = "none",
+          axis.title.x = element_text(size=7, angle=0, vjust=1.1),
+          axis.title.y = element_text(size=7, angle=90, vjust=-0),
+          axis.text.y = element_text(size=6, angle=0),
+          axis.text.x = element_text(size=6),
+          legend.text = element_text(size=6),
+          legend.title = element_text(size=7),
+          legend.key.size = unit(5, "mm"),
+          # panel.grid.major = element_blank(),
+          axis.line.x = element_line(),
+          axis.line.y = element_line(),
+          panel.background = element_blank())
+
+income.p[[2]] <- high_income[xmin == -5] %>% 
+  ggplot(aes(x=class,y=coef,fill = income))+
+    geom_bar(color = "#F0FFFF", position="dodge", stat="identity",width=0.6) +
+    geom_hline(aes(yintercept=0), linetype=1, color='black') +
+    geom_bar(position="dodge", stat="identity",width=0.6) +
+    geom_errorbar(mapping=aes(ymin=semin,ymax=semax), width=0.2, color="black",linewidth=.3, position = position_dodge(0.6)) +
+    geom_text(data = income.dif[t==0],aes(x,y,label =label,fill = NULL),size = 3)+
+    scale_fill_manual(values = c("#D3e1ae","#eea2a4")) +
+    scale_color_manual(values = c("#D3e1ae","#eea2a4")) +
+    ylab(expression(paste("Margin Effect of <0", degree, C))) +
+    coord_cartesian(ylim=c(-0.55,0.1)) +
+    theme(legend.position = "none",
+          axis.title.x = element_text(size=7, angle=0, vjust=1.1),
+          axis.title.y = element_text(size=7, angle=90, vjust=-0),
+          axis.text.y = element_text(size=6, angle=0),
+          axis.text.x = element_text(size=6),
+          legend.text = element_text(size=6),
+          legend.title = element_text(size=7),
+          legend.key.size = unit(5, "mm"),
+          # panel.grid.major = element_blank(),
+          axis.line.x = element_line(),
+          axis.line.y = element_line(),
+          panel.background = element_blank())
+```
+
+#plot
+```{r}
+# p1 <- ggarrange(urban.p[[2]],urban.p[[1]],nrow = 1,labels = c("a","b"))
+# p2 <- ggarrange(income.p[[2]],income.p[[1]],nrow = 1,labels = c("c","d"))
+# p3 <- ggarrange(holiday.p[[2]],holiday.p[[1]],nrow = 1,labels = c("e","f"))
+p4 <- ggarrange(urban.p[[2]],income.p[[2]],holiday.p[[2]],urban.p[[1]],income.p[[1]],holiday.p[[1]],nrow = 2,ncol = 3,labels = c("a","c","e","b","d","f"),font.label = list(size = 7, color = "black", face = "bold"))
+
+ggsave("~/ClimBehav_bj/results/plots/figure3.eps",plot = p4, device = "eps", width =180, height =120,units = "mm")
+ggsave("~/ClimBehav_bj/results/plots/figure3.pdf",plot = p4, device = "pdf", width =180, height =120,units = "mm")
+#save as eps
+
+#save as pdf
+# pdf(file = "~/ClimBehav_bj/results/plots/figure3test.pdf",width = 10,height = 12)
+# pushViewport(viewport(layout = grid.layout(3,1)))
+# print(p1, vp = viewport(layout.pos.row = 1,layout.pos.col = 1))
+# print(p2, vp = viewport(layout.pos.row = 3,layout.pos.col = 1))
+# print(p3, vp = viewport(layout.pos.row = 2,layout.pos.col = 1))
+# dev.off()
+```
+

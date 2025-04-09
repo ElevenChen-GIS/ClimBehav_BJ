@@ -1,0 +1,504 @@
+---
+title: "classRegression"
+author: "Chen Yu"
+format: html
+editor: 
+  markdown: 
+    wrap: 7
+---
+
+#Set up packages and environment
+
+```{r}
+#| label: environment
+#| include: false
+library(tidyverse)
+# library(terra)       #处理栅格数据
+library(magrittr)    #提供管道操作
+library(lubridate)    #提供时间有关函数
+library(data.table)
+library(fixest)   #提供feols函数
+library(lfe)  #提供felm函数
+# library(ggExtra) # for marginal histograms
+library(plyr) #for additional manipulation functions
+library(gridExtra) # for multiplots
+# library(tictoc) # measure time
+# library(parallel)     #提供并行运算
+library(zoo) #提供滑动平均函数
+# library(grid) #自定义常用主题
+library(cowplot) #拼图 for insert_xaxis_grob
+library(stargazer)
+
+source("~/ClimBehav_bj/results/scripts/binned_plot_function.R")
+load("~/ClimBehav_bj/results/data/raw/01_AOI/11-北京市-aoi.Rdata")
+threshold <- function(dt, a){
+  visit.stat <- dt %>% group_by(id) %>% dplyr::summarise(daily_visit_num = sum(visits / 365, na.rm = T))
+  base_select <- filter(visit.stat, daily_visit_num >= a)
+  dt <- dt %>%
+    dplyr::filter(id %in% base_select$id)
+  return(dt)
+}
+bootstrapCI <- function(n,a,b){
+  y = NULL
+  delta <- replicate(1000,expr = {
+  rnorm(n, a, b)})
+  for (i in 1:nrow(delta)) {
+    y <- rbind(y, as.numeric(quantile(delta[i,],c(.025,.975))))
+  }
+  return(list(y[,1],y[,2]))
+}
+# source("~/ClimBehav_bj/results/scripts/change_plot.R")
+```
+
+#Data preperation 
+## Climate & MP
+
+```{r}
+#| label: Data preparation(~2mins) 
+#| eval: true
+# tic()
+#读取climate_mp数据(~1.5mins)
+df <- fread(file = "~/ClimBehav_bj/results/data/processed/climate_mp.csv.gz", nThread = 14)
+
+#df数据集还原
+dig = 3
+cutt_levels <- c("(-10,-5]", "(-5,0]", "(0,5]", "(5,10]", "(10,15]", "(15,20]", "(20,25]", "(25,30]", "(30,35]", "(35,40]")
+
+df[,':='(
+  date = make_date(year, month, day),
+  t = t / 10 ^ dig,
+  sp = sp / 10^dig,   #将单位换算成hPa
+  tp = tp * 10^3,    #将单位换算成mm
+  blh = blh / 10^dig, 
+  tcc = tcc / 10^3,     #将单位换算成%   
+  wind = wind / 10^dig,
+  rhum = rhum / 10^dig,
+  visits = as.double(visits)
+  )][, ':='(
+    log_visit = log(visits + 1),
+    cutt = factor(cut(t, breaks = c(seq(from = -10, to = 40, by = 5))), levels = cutt_levels))]
+# toc()
+```
+
+##Classification 
+这一部分主要为了探究如何从mp数据中找到能代表全域的AOI，并且将现有类别进行clear
+1.  classify AOI using behavior system;
+
+2.  filter out large AOI with visitors greater than 50 people per day;
+
+3.  filter out the daytime(7 am ~ 23pm).
+
+```{r}
+###### 1.classification ######
+##############################
+
+df_classify<- aoi %>% as.data.table()
+#######1.居家行为#########
+df_classify[str_detect(type, "^120302") & str_detect(name, "(建设中)|(装修中)") == 0, ':='(class = 1, subclass = 1)] #住宅小区
+
+#######2.公园访问#########
+df_classify[str_detect(type, "^1101(00|01|05|06)") & str_detect(name, "(建设中)|(装修中)") == 0, ':='(class = 2, subclass = 2)] #公园广场和内部设施
+df_classify[str_detect(type, "^1101(02|03|04)") & str_detect(name, "(建设中)|(装修中)") == 0, ':='(class = 2, subclass = 3)] #主题公园
+df_classify[str_detect(type, "^1102(00|01|02|03|04|05|06|07|09)") & str_detect(name, "(建设中)|(装修中)") == 0, ':='(class = 2, subclass = 4)] #风景名胜
+
+####### 3.Transport #########
+df_classify[str_detect(type, "^(150104|150200|1504)") & str_detect(name, "(建设中)|(装修中)") == 0, ':='(class = 3, subclass = 5)] #机场、火车站、长途车站
+df_classify[str_detect(type, "^1503(01|02|03)|151200") & str_detect(name, "(建设中)|(装修中)") == 0, ':='(class = 3, subclass = 6)] #渡口、港口
+
+#######4.Workplace#########
+df_classify[str_detect(type, "^1704") & str_detect(name, "(建设中)|(装修中)") == 0, ':='(class = 4, subclass = 7)] #农林牧渔基地
+df_classify[str_detect(type, "^1202|^17(01|02)") & str_detect(name, "(建设中)|(装修中)") == 0, ':='(class = 4, subclass = 8)] #公司企业、写字楼
+df_classify[str_detect(type, "^1703|^1201") & str_detect(name, "(建设中)|(装修中)") == 0, ':='(class = 4, subclass = 9)] #工厂，产业园
+df_classify[str_detect(name, "(建设中)|(装修中)"), ':='(class = 4, subclass = 10)] #建筑工地,需要放在所有分类的最后
+df_classify <- df_classify[is.na(class) == 0, .(id, class, subclass)]
+df <- inner_join(df_classify, df, by = "id", relationship = "many-to-many")
+rm(df_classify)
+gc()
+
+#threshold by class
+df <- df %>% threshold(50) %>%
+  dplyr::filter(hour >= 7 & hour <= 22)
+gc()
+```
+
+# Main regression
+
+## Hourly
+
+(1) generate the bins for temperature
+
+(2)  R plot: temperature bins
+
+```{r}
+#| label: Work&live regresion(~ 3mins)
+
+# tic()
+reg <- NULL
+t_p <- NULL
+xdsty <- NULL
+pClass <- NULL
+t_coef <- NULL
+workLiveLabel <- c("Residential", "Park", "Transport", "Workplace")
+df$class <- df$class %>% 
+  factor() %>% 
+  revalue(c("1" = "Residential", "2" = "Park", "3" = "Transport", "4" = "Workplace")) %>% 
+  factor(levels = c("Residential", "Park", "Transport", "Workplace"))
+classColor <- c("Residential" = "#457b9d","Park" = "#84a729","Transport" = "#C75c64","Workplace" = "#f0b57d")
+classSubColor <- c("Residential" = "#e6f1f3","Park" = "#D3e1ae","Transport" = "#eea2a4","Workplace" = "#f8e8c1")
+## 第一个位置：新建一个其实进度条
+pb <- txtProgressBar(style=3)
+recycle_list <- c(1:4)
+```
+class
+
+```{r}
+##testing model
+
+
+for (i in 1:4) {
+  x <- workLiveLabel[i]
+  dt <- df[class == x]
+  dt <- within(dt, cutt <- relevel(cutt, ref = "(20,25]"))
+
+  reg[[i]] <- felm(log_visit ~
+                      cutt + tp + wind + rhum + sp + tcc + holidays +aqi +blh
+                     |id + hour + month + dow
+                     |0|id,
+                      data = dt, na.action="na.omit")
+  # summary(reg[[i]])
+  t_coef[[i]] <- felmCoeff(reg[[i]],var = "cutt", omit = c(20, 25)) %>%
+    select(coef, se, star, xmid, range, ci.l, ci.h) %>% 
+    mutate(class = i)
+  dt <- as.data.table(t_coef[[i]])
+  dt[,c("ci.l","ci.h") := bootstrapCI(10,coef, se)]
+  t_p[[i]] <- ggplot() +
+      geom_hline(aes(yintercept=0), linetype=2, color='black') +
+      geom_ribbon(data=dt, aes(x=xmid, ymin=ci.l*100, ymax=ci.h*100), fill=classSubColor[x], alpha=1) +
+      geom_line(data=dt, aes(x=xmid, y=coef * 100), color=classColor[x], linewidth=1, alpha=1) +
+      ylab("Percentage change in visitation") +
+      xlab(expression(paste("Hourly Temperature (", degree, C, ")")))+
+      labs(title = x) +
+      annotate("text", label="", x = min(c(-10,40)), y = min(c(-50,10)), size=8) +
+      coord_cartesian(xlim=c(-10,40), ylim=c(-50,10), expand=TRUE) +
+      theme(plot.title = element_text(size=20),
+            axis.title.x = element_text(size=15, angle=0, vjust=1.1),
+            axis.title.y = element_text(size=15, angle=90, vjust=-0),
+            axis.text.y = element_text(size=20, angle=0),
+            axis.text.x = element_text(size=15),
+            axis.ticks.y = element_line(),
+            panel.grid.major = element_blank(),
+            panel.grid.minor = element_blank(),
+            panel.background = element_blank(),
+            axis.line.x = element_line(),
+            axis.line.y = element_line(),
+            legend.title=element_blank()
+      ) + 
+    scale_y_continuous(breaks = seq(-40, 10, by = 10))
+  xdsty[[i]] <- ggplot(df[class == workLiveLabel[i]]) +
+    geom_area(aes(x = t),stat = "density", fill = classSubColor[i],colour = classColor[i]) +
+    theme(plot.title = element_text(size=20),
+          axis.title.x = element_text(size=15, angle=0, vjust=1.1),
+          axis.title.y = element_text(size=15, angle=90, vjust=-0),
+          axis.text.y = element_text(size=15),
+          axis.text.x = element_text(size=15),
+          axis.ticks.y = element_line(),
+          panel.grid.major = element_blank(),
+          panel.grid.minor = element_blank(),
+          panel.background = element_blank(),
+          axis.line.x = element_line(),
+          axis.line.y = element_line(),
+          legend.title=element_blank()
+    )
+  pClass[[i]] <- insert_xaxis_grob(t_p[[i]], xdsty[[i]], position = "bottom")
+  setTxtProgressBar(pb, i/length(recycle_list))
+}
+
+## 第三个位置关闭进度条
+close(pb)
+```
+## Daily
+```{r}
+df_daily<- df[,':='(visits = sum(visits, na.rm = T), 
+                  t.max = max(t, na.rm = T), 
+                  t.mean = mean(t, na.rm = T), 
+                  t.min = min(t, na.rm = T),
+                  sp = mean(sp, na.rm = T),
+                  tp = mean(tp, na.rm = T),
+                  blh = mean(blh, na.rm = T),
+                  tcc = mean(tcc, na.rm = T),
+                  wind = mean(wind, na.rm = T),
+                  rhum = mean(rhum, na.rm = T),
+                  aqi = mean(aqi, na.rm = T)
+                  ), by = .(id, date)][, ':='(
+                    log_visit = log(visits + 1),
+                    cutt.max = factor(cut(t.max, breaks = c(seq(from = -10, to = 40, by = 5))), levels = cutt_levels),
+                    cutt.mean = factor(cut(t.mean, breaks = c(seq(from = -10, to = 40, by = 5))), levels = cutt_levels),
+                    cutt.min = factor(cut(t.min, breaks = c(seq(from = -10, to = 40, by = 5))), levels = cutt_levels)
+                  )] %>% 
+  distinct(id,date,.keep_all = TRUE)
+gc()
+```
+
+regression
+```{r}
+regD <- NULL
+t_daily_p <- NULL
+t_coef_daily <- NULL
+daily_p.double <- NULL
+xdstyD <- NULL
+
+for (i in 1:4) {
+  x <- workLiveLabel[i]
+  dt <- df_daily[class == x]
+  dt <- within(dt, cutt.max <- relevel(cutt.max, ref = "(20,25]"))
+
+  regD[[i]] <- felm(log_visit ~
+                      cutt.max + tp + wind + rhum + sp + tcc + holidays +aqi +blh        #   covariates |
+                     |id + month + dow
+                     |0|id,
+                      data = dt, na.action="na.omit")
+  
+  # summary(t_fe[[x]])
+  t_coef_daily[[i]] <- felmCoeff(regD[[i]],var = "cutt.max",breaks = 5, omit = c(20, 25)) %>%
+      select(coef, se, star, xmid, range, ci.l, ci.h)
+}
+for (i in 1:4) {
+  x <- workLiveLabel[i]
+  dt <- df_daily[class == x]
+  dt <- within(dt, cutt.mean <- relevel(cutt.mean, ref = "(20,25]"))
+
+  regD[[i+4]] <- felm(log_visit ~
+                      cutt.mean + tp + wind + rhum + sp + tcc + holidays +aqi +blh        #   covariates |
+                     |id + month + dow
+                     |0|id,
+                      data = dt, na.action="na.omit")
+  
+  # summary(t_fe[[x]])
+  t_coef_daily[[i+4]] <- felmCoeff(regD[[i+4]],var = "cutt.mean",breaks = 5, omit = c(20, 25)) %>%
+      select(coef, se, star, xmid, range, ci.l, ci.h)
+}
+for (i in 1:4) {
+  x <- workLiveLabel[i]
+  dt <- df_daily[class == x]
+  dt <- within(dt, cutt.min <- relevel(cutt.min, ref = "(20,25]"))
+
+  regD[[i+8]] <- felm(log_visit ~
+                      cutt.min + tp + wind + rhum + sp + tcc + holidays +aqi +blh        #   covariates |
+                     |id + month + dow
+                     |0|id,
+                      data = dt, na.action="na.omit")
+  
+  # summary(t_fe[[x]])
+  t_coef_daily[[i+8]] <- felmCoeff(regD[[i+8]],var = "cutt.min",breaks = 5, omit = c(20, 25)) %>%
+        select(coef, se, star, xmid, range, ci.l, ci.h)
+}
+for (i in c(1:5,7:8)) {
+  dt <- as.data.table(t_coef_daily[[i]])
+  dt[,c("ci.l","ci.h") := bootstrapCI(10,coef, se)]
+  t_coef_daily[[i]] <- dt
+}
+  dt <- as.data.table(t_coef_daily[[6]])
+  dt[,c("ci.l","ci.h") := bootstrapCI(9,coef, se)]
+  t_coef_daily[[6]] <- dt
+for (i in 9:12) {
+  dt <- as.data.table(t_coef_daily[[i]])
+  dt[,c("ci.l","ci.h") := bootstrapCI(8,coef, se)]
+  t_coef_daily[[i]] <- dt
+}
+for (i in 1:4) {
+  x <- workLiveLabel[i]
+  t_daily_p[[i]] <-ggplot() +
+      geom_hline(aes(yintercept=0), linetype=2, color='black') +
+      geom_ribbon(data=t_coef_daily[[i+8]], aes(x=xmid, ymin=ci.l*100, ymax=ci.h*100), fill="#457b9d", alpha=0.1) +
+      geom_line(data=t_coef_daily[[i+8]], aes(x=xmid, y=coef * 100), color="#457b9d", linewidth=1, alpha=1) +
+      ylab("Percentage change in visitation") +
+      xlab(expression(paste("Daily Temperature (", degree, C, ")")))+
+      labs(title = x) +
+      annotate("text", label="", x = min(c(-10,40)), y = min(c(-50,10)), size=8) +
+      coord_cartesian(xlim=c(-10,40), ylim=c(-50,10), expand=TRUE) +
+      theme(plot.title = element_text(size=20),
+            axis.title.x = element_text(size=15, angle=0, vjust=1.1),
+            axis.title.y = element_text(size=15, angle=90, vjust=-0),
+            axis.text.y = element_text(size=20, angle=0),
+            axis.text.x = element_text(size=15),
+            axis.ticks.y = element_line(),
+            panel.grid.major = element_blank(),
+            panel.grid.minor = element_blank(),
+            panel.background = element_blank(),
+            axis.line.x = element_line(),
+            axis.line.y = element_line(),
+            legend.title=element_blank()
+      ) + 
+    geom_ribbon(data=t_coef_daily[[i]], aes(x=xmid, ymin=ci.l, ymax=ci.h), fill="#ff3300", alpha=0.1) +
+    geom_line(data=t_coef_daily[[i]], aes(x=xmid, y=coef * 100), color="#ff3300", linewidth=2, alpha=1) +
+    geom_ribbon(data=t_coef_daily[[i+4]], aes(x=xmid, ymin=ci.l, ymax=ci.h), fill="#3de1ad", alpha=0.1) +
+    geom_line(data=t_coef_daily[[i+4]], aes(x=xmid, y=coef * 100), color="#3de1ad", linewidth=2, alpha=1) +
+    scale_y_continuous(breaks = seq(-40, 10, by = 10))
+  
+  xdsty[[i]] <- ggplot(df_daily[class == workLiveLabel[i]]) +
+    geom_density(aes(x = t.max,y =after_stat(density)),alpha = 0.1,fill = "#ff3300", color = "#ff3300") +
+    geom_density(aes(x = t.mean,y =after_stat(density)),alpha = 0.1,fill = "#3de1ad", color = "#3de1ad") +
+    geom_density(aes(x = t.min,y =after_stat(density)),alpha = 0.1,fill = "#457b9d", color = "#457b9d") +
+    theme(plot.title = element_text(size=20),
+          axis.title.x = element_text(size=15, angle=0, vjust=1.1),
+          axis.title.y = element_text(size=15, angle=90, vjust=-0),
+          axis.text.y = element_text(size=15),
+          axis.text.x = element_text(size=15),
+          axis.ticks.y = element_line(),
+          panel.grid.major = element_blank(),
+          panel.grid.minor = element_blank(),
+          panel.background = element_blank(),
+          axis.line.x = element_line(),
+          axis.line.y = element_line(),
+          legend.title=element_blank()
+    )
+  daily_p.double[[i]] <- insert_xaxis_grob(t_daily_p[[i]], xdsty[[i]], position = "bottom")
+}
+pD <- grid.arrange(ggdraw(daily_p.double[[1]]), ggdraw(daily_p.double[[2]]), ggdraw(daily_p.double[[3]]), ggdraw(daily_p.double[[4]]), nrow = 1)
+```
+
+# Subclass regression
+```{r}
+#| label: Work&live regresion(~ 3mins)
+
+# tic()
+regSub <- NULL
+t_pSub <- NULL
+xdstySub <- NULL
+pClassSub <- NULL
+t_coefSub <- NULL
+# workLiveLabelSub <- c("Residential", "Park", "Transport", "Workplace")
+# df$subclass <- df$subclass %>% 
+#   factor() %>% 
+#   revalue(c("1" = "Residential", "2" = "Park", "3" = "Transport", "4" = "Workplace")) %>% 
+#   factor(levels = c("Residential", "Park", "Transport", "Work"))
+# classColor <- c("Residential" = "#457b9d","Park" = "#84a729","Transport" = "#C75c64","Workplace" = "#f0b57d")
+# classSubColor <- c("Residential" = "#e6f1f3","Park" = "#D3e1ae","Transport" = "#eea2a4","Workplace" = "#f8e8c1")
+## 第一个位置：新建一个其实进度条
+pb <- txtProgressBar(style=3)
+recycle_list <- c(1:10)
+```
+subclass
+
+```{r}
+##testing model
+
+#subclass :6渡口样本过少
+for (i in 1:10) {
+  # x <- workLiveLabel[i]
+  # dt <- df[class == x]
+  if(i == 6) next
+  x <- i
+  dt <- df[subclass == x]
+  dt <- within(dt, cutt <- relevel(cutt, ref = "(20,25]"))
+
+  regSub[[i]] <- felm(log_visit ~
+                      cutt + tp + wind + rhum + sp + tcc + holidays +aqi +blh
+                     |id + hour + month + dow
+                     |0|id,
+                      data = dt, na.action="na.omit")
+  # summary(reg[[i]])
+  t_coefSub[[i]] <- felmCoeff(reg[[i]],var = "cutt", omit = c(20, 25)) %>%
+    select(coef, se, star, xmid, range, ci.l, ci.h) %>% 
+    mutate(subclass = i)
+  dt <- as.data.table(t_coef[[i]])
+  dt[,c("ci.l","ci.h") := bootstrapCI(10,coef, se)]
+  t_pSub[[i]] <- ggplot() +
+      geom_hline(aes(yintercept=0), linetype=2, color='black') +
+      geom_ribbon(data=dt, aes(x=xmid, ymin=ci.l*100, ymax=ci.h*100), fill="#e6f1f3", alpha=1) +
+      geom_line(data=dt, aes(x=xmid, y=coef * 100), color="#457b9d", linewidth=1, alpha=1) +
+      ylab("Percentage change in visitation") +
+      xlab(expression(paste("Hourly Temperature (", degree, C, ")")))+
+      labs(title = x) +
+      annotate("text", label="", x = min(c(-10,40)), y = min(c(-50,10)), size=8) +
+      coord_cartesian(xlim=c(-10,40), ylim=c(-50,10), expand=TRUE) +
+      theme(plot.title = element_text(size=20),
+            axis.title.x = element_text(size=15, angle=0, vjust=1.1),
+            axis.title.y = element_text(size=15, angle=90, vjust=-0),
+            axis.text.y = element_text(size=20, angle=0),
+            axis.text.x = element_text(size=15),
+            axis.ticks.y = element_line(),
+            panel.grid.major = element_blank(),
+            panel.grid.minor = element_blank(),
+            panel.background = element_blank(),
+            axis.line.x = element_line(),
+            axis.line.y = element_line(),
+            legend.title=element_blank()
+      ) + 
+    scale_y_continuous(breaks = seq(-40, 10, by = 10))
+  xdstySub[[i]] <- ggplot(df[subclass == i]) +
+    geom_area(aes(x = t),stat = "density", fill = "#e6f1f3",colour = "#457b9d") +
+    theme(plot.title = element_text(size=20),
+          axis.title.x = element_text(size=15, angle=0, vjust=1.1),
+          axis.title.y = element_text(size=15, angle=90, vjust=-0),
+          axis.text.y = element_text(size=15),
+          axis.text.x = element_text(size=15),
+          axis.ticks.y = element_line(),
+          panel.grid.major = element_blank(),
+          panel.grid.minor = element_blank(),
+          panel.background = element_blank(),
+          axis.line.x = element_line(),
+          axis.line.y = element_line(),
+          legend.title=element_blank()
+    )
+  pClassSub[[i]] <- insert_xaxis_grob(t_pSub[[i]], xdstySub[[i]], position = "bottom")
+  setTxtProgressBar(pb, i/length(recycle_list))
+}
+
+rm(dt)
+gc()
+## 第三个位置关闭进度条
+close(pb)
+```
+# Save
+## Hourly 
+```{r}
+save(pClass, file = "~/ClimBehav_bj/results/data/processed/pClass.RData")
+save(pClassSub, file = "~/ClimBehav_bj/results/data/processed/pClassSub.RData")
+t_coef <- rbindlist(t_coef)
+fwrite(t_coef, file = "~/ClimBehav_bj/results/data/processed/t_coef.csv", nThread = 14)
+gc()
+# 
+# save coef as word
+stargazer(reg[[1]], reg[[2]], reg[[3]], reg[[4]],
+          dep.var.labels.include = F,
+          # colnames = c("Residential", "Park", "Transport", "Workplace"),
+          covariate.labels = c("(-10,-5]", "(-5,0]", "(0,5]", "(5,10]", "(10,15]", "(15,20]", "(25,30]", "(30,35]", "(35,40]","tp","wind","rhum","sp","tcc","holidays","aqi","blh"),
+          omit.stat = c("LL","ser","f","rsq"),
+          star.cutoffs = c(0.05, 0.01, 0.001),
+          type = "html",
+          out = "~/ClimBehav_bj/results/plots/mainRegression.doc"
+          )
+```
+## Daily
+```{r}
+stargazer(regD[[1]], regD[[2]], regD[[3]], regD[[4]],
+          dep.var.labels.include = F,
+          # colnames = c("Residential", "Park", "Transport", "Workplace"),
+          covariate.labels = c("(-10,-5]", "(-5,0]", "(0,5]", "(5,10]", "(10,15]", "(15,20]", "(25,30]", "(30,35]", "(35,40]","tp","wind","rhum","sp","tcc","holidays","aqi","blh"),
+          omit.stat = c("LL","ser","f","rsq"),
+          star.cutoffs = c(0.05, 0.01, 0.001),
+          type = "html",
+          out = "~/ClimBehav_bj/results/plots/dailyMx.doc"
+          )
+stargazer(regD[[5]], regD[[6]], regD[[7]], regD[[8]],
+          dep.var.labels.include = F,
+          # colnames = c("Residential", "Park", "Transport", "Workplace"),
+          covariate.labels = c("(-10,-5]", "(-5,0]", "(0,5]", "(5,10]", "(10,15]", "(15,20]", "(25,30]", "(30,35]", "(35,40]","tp","wind","rhum","sp","tcc","holidays","aqi","blh"),
+          omit.stat = c("LL","ser","f","rsq"),
+          star.cutoffs = c(0.05, 0.01, 0.001),
+          type = "html",
+          out = "~/ClimBehav_bj/results/plots/dailyMe.doc"
+          )
+stargazer(regD[[9]], regD[[10]], regD[[11]], regD[[12]],
+          dep.var.labels.include = F,
+          # colnames = c("Residential", "Park", "Transport", "Workplace"),
+          covariate.labels = c("(-10,-5]", "(-5,0]", "(0,5]", "(5,10]", "(10,15]", "(15,20]", "(25,30]","tp","wind","rhum","sp","tcc","holidays","aqi","blh"),
+          omit.stat = c("LL","ser","f","rsq"),
+          star.cutoffs = c(0.05, 0.01, 0.001),
+          type = "html",
+          out = "~/ClimBehav_bj/results/plots/dailyMi.doc"
+          )
+
+```
+

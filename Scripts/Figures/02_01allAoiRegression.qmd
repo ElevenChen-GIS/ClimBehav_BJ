@@ -1,0 +1,397 @@
+---
+title: "allAOIregression"
+author: "Chen Yu"
+format: html
+editor: 
+  markdown: 
+    wrap: 7
+---
+
+#Set up packages and environment
+
+```{r}
+#| label: environment
+#| include: false
+library(tidyverse)
+library(terra)       #处理栅格数据
+library(magrittr)    #提供管道操作
+library(lubridate)    #提供时间有关函数
+library(data.table)
+library(fixest)   #提供feols函数
+library(lfe)  #提供felm函数
+library(ggExtra) # for marginal histograms
+library(plyr) #for additional manipulation functions
+library(gridExtra) # for multiplots
+# library(tictoc) # measure time
+library(parallel)     #提供并行运算
+library(zoo) #提供滑动平均函数
+library(grid) #自定义常用主题
+library(cowplot) #拼图
+
+source("~/ClimBehav_bj/results/scripts/binned_plot_function.R")
+load("~/ClimBehav_bj/results/data/raw/01_AOI/11-北京市-aoi.Rdata")
+threshold <- function(dt, a){
+  visit.stat <- dt %>% group_by(id) %>% dplyr::summarise(daily_visit_num = sum(visits / 365, na.rm = T))
+  base_select <- filter(visit.stat, daily_visit_num >= a)
+  dt <- dt %>%
+    dplyr::filter(id %in% base_select$id)
+  return(dt)
+}
+season<- function(df){
+  df$season<-4
+  df$season[df$month >= 9 & df$month <= 11]<-3
+  df$season[df$month >= 6 & df$month <= 8]<-2
+  df$season[df$month >= 3 & df$month <= 5]<-1
+  return(df)
+}
+bootstrapCI <- function(n,a,b){
+  y = NULL
+  delta <- replicate(1000,expr = {
+  rnorm(n, a, b)})
+  for (i in 1:nrow(delta)) {
+    y <- rbind(y, as.numeric(quantile(delta[i,],c(.025,.975))))
+  }
+  return(list(y[,1],y[,2]))
+}
+# source("~/ClimBehav_bj/results/scripts/change_plot.R")
+```
+
+#Data preperation 
+## Climate & MP
+
+```{r}
+#| label: Data preparation(~2mins) 
+#| eval: true
+# tic()
+#读取climate_mp数据(~1.5mins)
+df <- fread(file = "~/ClimBehav_bj/results/data/processed/climate_mp.csv.gz", nThread = 14)
+
+#df数据集还原
+dig = 3
+cutt_levels <- c("(-10,-5]", "(-5,0]", "(0,5]", "(5,10]", "(10,15]", "(15,20]", "(20,25]", "(25,30]", "(30,35]", "(35,40]")
+
+df[,':='(
+  date = make_date(year, month, day),
+  t = t / 10 ^ dig,
+  sp = sp / 10^dig,   #将单位换算成hPa
+  tp = tp * 10^3,    #将单位换算成mm
+  blh = blh / 10^dig, 
+  tcc = tcc / 10^3,     #将单位换算成%   
+  wind = wind / 10^dig,
+  rhum = rhum / 10^dig,
+  visits = as.double(visits)
+  )][, ':='(
+    log_visit = log(visits + 1),
+    cutt = factor(cut(t, breaks = c(seq(from = -10, to = 40, by = 5))), levels = cutt_levels))]
+# toc()
+```
+
+##Classification 
+这一部分主要为了探究如何从mp数据中找到能代表全域的AOI，并且将现有类别进行clear
+
+```{r}
+###### 1.classification ######
+##############################
+
+df_classify<- aoi %>% as.data.table()
+#######1.居家行为#########
+df_classify[str_detect(type, "^120302") & str_detect(name, "(建设中)|(装修中)") == 0, ':='(class = 1, subclass = 1)] #住宅小区
+
+#######2.公园访问#########
+df_classify[str_detect(type, "^1101(00|01|05|06)") & str_detect(name, "(建设中)|(装修中)") == 0, ':='(class = 2, subclass = 2)] #公园广场和内部设施
+df_classify[str_detect(type, "^1101(02|03|04)") & str_detect(name, "(建设中)|(装修中)") == 0, ':='(class = 2, subclass = 3)] #主题公园
+df_classify[str_detect(type, "^1102(00|01|02|03|04|05|06|07|09)") & str_detect(name, "(建设中)|(装修中)") == 0, ':='(class = 2, subclass = 4)] #风景名胜
+
+####### 3.Transport #########
+df_classify[str_detect(type, "^(150104|150200|1504)") & str_detect(name, "(建设中)|(装修中)") == 0, ':='(class = 3, subclass = 5)] #机场、火车站、长途车站
+df_classify[str_detect(type, "^1503(01|02|03)|151200") & str_detect(name, "(建设中)|(装修中)") == 0, ':='(class = 3, subclass = 6)] #渡口、港口
+
+#######4.Work#########
+df_classify[str_detect(type, "^1704") & str_detect(name, "(建设中)|(装修中)") == 0, ':='(class = 4, subclass = 7)] #农林牧渔基地
+df_classify[str_detect(type, "^1202|^17(01|02)") & str_detect(name, "(建设中)|(装修中)") == 0, ':='(class = 4, subclass = 8)] #公司企业、写字楼
+df_classify[str_detect(type, "^1703|^1201") & str_detect(name, "(建设中)|(装修中)") == 0, ':='(class = 4, subclass = 9)] #工厂，产业园
+df_classify[str_detect(name, "(建设中)|(装修中)"), ':='(class = 4, subclass = 10)] #建筑工地,需要放在所有分类的最后
+df_classify <- df_classify[is.na(class) == 0, .(id, class, subclass)]
+df <- inner_join(df_classify, df, by = "id", relationship = "many-to-many")
+rm(df_classify)
+gc()
+```
+
+##Threshold analysis 
+###Analysis
+
+```{r}
+#全区间
+# p <- NULL
+#   dt <- df
+#   visit.stat <- dt %>% group_by(id) %>% dplyr::summarise(daily_visit_num = sum(visits / 365, na.rm = T))
+#   # Mvisit <- max(visit.stat$daily_visit_num)
+#   p[[1]] <- visit.stat %>% 
+#     # filter(daily_visit_num <= 1000) %>%
+#   ggplot(aes(daily_visit_num)) +
+#     geom_histogram(binwidth = 1000) +
+#     xlab("日均访问量") +
+#     scale_x_continuous(breaks = c(0, 1000, 5000, 10000, 20000, 30000), limits = c(-500, 30000))
+#     # scale_x_continuous(limits = c(0, Mvisit))
+# 
+# #<1000的区间
+#   dt <- df
+#   visit.stat <- dt %>% group_by(id) %>% dplyr::summarise(daily_visit_num = sum(visits / 365, na.rm = T))
+#   # Mvisit <- max(visit.stat$daily_visit_num)
+#   p[[2]] <- visit.stat %>% 
+#     filter(daily_visit_num <= 1000) %>%
+#     ggplot(aes(daily_visit_num)) +
+#       geom_histogram() +
+#       xlab("日均访问量") +
+#       scale_x_continuous(breaks = c(seq(0, 1000, 100)))
+#       # scale_x_continuous(limits = c(0, Mvisit))
+```
+
+###Threshold
+
+```{r}
+# tic()
+df <- df %>% 
+  threshold(50) %>% 
+  dplyr::filter(hour >= 7 & hour <= 22)
+# df[, .N]/5840
+# toc()
+```
+
+#main regression and save
+
+```{r}
+df <- season(df)
+dt_summar <- within(df[season == 2], cutt <- relevel(cutt, ref = "(20,25]"))
+dt_winter <- within(df[season == 4], cutt <- relevel(cutt, ref = "(10,15]"))
+
+reg_winter <- felm(log_visit ~
+                      cutt + tp + wind + rhum + sp + tcc + holidays +aqi +blh        #   covariates |
+                     |id + hour + month + dow
+                     |0|type,
+                      data = dt_winter, na.action="na.omit")
+reg_summar <- felm(log_visit ~
+                      cutt + tp + wind + rhum + sp + tcc + holidays +aqi +blh        #   covariates |
+                     |id + hour + month + dow
+                     |0|type,
+                      data = dt_summar, na.action="na.omit")
+  # summary(t_fe[[x]])
+t_coef_winter <- felmCoeff(reg_winter,var = "cutt", omit = c(10, 15)) %>%
+      dplyr::select(coef, se, star, xmid, range, ci.l, ci.h)
+t_coef_summar <- felmCoeff(reg_summar,var = "cutt", omit = c(20, 25)) %>%
+      dplyr::select(coef, se, star, xmid, range, ci.l, ci.h)
+  
+  t_coef_winter <- as.data.table(t_coef_winter)
+  t_coef_summar <- as.data.table(t_coef_summar)
+  t_coef_winter[,c("ci.l","ci.h") := bootstrapCI(6,coef, se)]
+  t_coef_summar[,c("ci.l","ci.h") := bootstrapCI(7,coef, se)]
+  # t_p[[i]] <-binned.plot(felm.est = reg[[i]],
+  #                   plotvar = "cutt",
+  #                   breaks = 5,
+  #                   omit = c(20, 25),
+  #                   xlimit = c(-10,40),
+  #                   ylimit = c(-50,10),
+  #                   panel = "",
+  #                   group = x,
+  #                   xlabel = expression(paste("Hourly Temperature (", degree, C, ")")),
+  #                   ylabel = "Percentage change in visitation",
+  #                   linecolor=classColor[x], 
+  #                   pointfill=classColor[x], 
+  #                   pointcolor=classColor[x],
+  #                   errorfill = classSubColor[x]
+  # ) + 
+  # scale_y_continuous(breaks = seq(-40, 10, by = 10))
+  t_p_summar <- ggplot() +
+      geom_hline(aes(yintercept=0), linetype=2, color='black') +
+      geom_ribbon(data=t_coef_summar, aes(x=xmid, ymin=ci.l*100, ymax=ci.h*100), fill="#eea2a4", alpha=1) +
+      geom_line(data=t_coef_summar, aes(x=xmid, y=coef * 100), color="#C75c64", linewidth=1, alpha=1) +
+      ylab("Percentage change in visitation") +
+      xlab(expression(paste("Hourly Temperature (", degree, C, ")")))+
+      labs(title = "4 categories in summar") +
+      annotate("text", label="", x = min(c(-10,40)), y = min(c(-50,10)), size=8) +
+      coord_cartesian(xlim=c(-10,40), ylim=c(-50,10), expand=TRUE) +
+      theme(plot.title = element_text(size=20),
+            axis.title.x = element_text(size=15, angle=0, vjust=1.1),
+            axis.title.y = element_text(size=15, angle=90, vjust=-0),
+            axis.text.y = element_text(size=20, angle=0),
+            axis.text.x = element_text(size=15),
+            axis.ticks.y = element_line(),
+            panel.grid.major = element_blank(),
+            panel.grid.minor = element_blank(),
+            panel.background = element_blank(),
+            axis.line.x = element_line(),
+            axis.line.y = element_line(),
+            legend.title=element_blank()
+      ) + 
+    scale_y_continuous(breaks = seq(-40, 10, by = 10)) +
+    theme(legend.position = "none")
+# t_p <-binned.plot(felm.est = reg_winter,
+#                   plotvar = "cutt",
+#                   breaks = 5,
+#                   omit = c(10, 15),
+#                   xlimit = c(-10,40),
+#                   ylimit = c(-40,10),
+#                   panel = "",
+#                   group = "4 categories",
+#                   xlabel = expression(paste("Hourly Temperature (", degree, C, ")")),
+#                   ylabel = "Percentage change in visitation",
+#                   linecolor = "#457b9d",
+#                   errorfill = "#a8dadb"
+#   ) + 
+#   geom_ribbon(data = t_coef_summar,aes(x= xmid,ymin = ci.l,ymax = ci.h, fill = "#eea2a4"),alpha = 0.25) +
+#   geom_line(data = t_coef_summar,aes(x = xmid,y = coef*100,colour = "#C75c64"), linewidth=2) +
+#   scale_y_continuous(breaks = seq(-40, 10, by = 10)) +
+#   theme(legend.position = "none")
+  xdsty_summar <- ggplot() +
+    # geom_histogram(aes(x = t,y =after_stat(density)), binwidth = 1, fill = "#4DBBD5FF", color = "#F0FFFF") +
+    # geom_density(aes(x = t,y =after_stat(density)),color = "#4DBBD5FF") +
+    geom_area(data = dt_summar,aes(x = t),stat = "density", fill = "#eea2a4",colour = "#C75c64") +
+    coord_cartesian(xlim=c(-10,40), expand=TRUE) +
+    theme(plot.title = element_text(size=20),
+          axis.title.x = element_text(size=15, angle=0, vjust=1.1),
+          axis.title.y = element_text(size=15, angle=90, vjust=-0),
+          axis.text.y = element_text(size=15),
+          axis.text.x = element_text(size=15),
+          axis.ticks.y = element_line(),
+          panel.grid.major = element_blank(),
+          panel.grid.minor = element_blank(),
+          panel.background = element_blank(),
+          axis.line.x = element_line(),
+          axis.line.y = element_line(),
+          legend.title=element_blank()
+    )
+  t_p_winter <- ggplot() +
+      geom_hline(aes(yintercept=0), linetype=2, color='black') +
+      geom_ribbon(data=t_coef_winter, aes(x=xmid, ymin=ci.l*100, ymax=ci.h*100), fill="#a8dadb", alpha=1) +
+      # geom_line(data=dt, aes(x=xmid, y=ci.l), linetype="dotted", color="grey50", size=0.75, alpha=1) +
+      # geom_line(data=dt, aes(x=xmid, y=ci.h), linetype="dotted", color="grey50", size=0.75, alpha=1) +
+      geom_line(data=t_coef_winter, aes(x=xmid, y=coef * 100), color="#457b9d", linewidth=1, alpha=1) +
+      # geom_point(data=, aes(x=xmid, y=coef * 100), size=2, fill=pointfill, color='black', pch=21, alpha=1) +
+      ylab("Percentage change in visitation") +
+      xlab(expression(paste("Hourly Temperature (", degree, C, ")")))+
+      labs(title = "4 categories in winter") +
+      annotate("text", label="", x = min(c(-10,40)), y = min(c(-50,10)), size=8) +
+      # annotate("text", label=paste0("Histogram of ", xlabel), x = median(dt$xmid), y = max(ylimit) + max(ylimit)/4, size=hist.text.size) +
+      coord_cartesian(xlim=c(-10,40), ylim=c(-50,10), expand=TRUE) +
+      # scale_x_continuous(breaks = unique(round_any(dt$xmid, roundx)), labels = unique(round_any(dt$xmid, roundx))) +
+      theme(plot.title = element_text(size=20),
+            axis.title.x = element_text(size=15, angle=0, vjust=1.1),
+            axis.title.y = element_text(size=15, angle=90, vjust=-0),
+            axis.text.y = element_text(size=20, angle=0),
+            axis.text.x = element_text(size=15),
+            axis.ticks.y = element_line(),
+            panel.grid.major = element_blank(),
+            panel.grid.minor = element_blank(),
+            panel.background = element_blank(),
+            axis.line.x = element_line(),
+            axis.line.y = element_line(),
+            legend.title=element_blank()
+      ) + 
+    scale_y_continuous(breaks = seq(-40, 10, by = 10)) +
+    theme(legend.position = "none")
+# t_p <-binned.plot(felm.est = reg_winter,
+#                   plotvar = "cutt",
+#                   breaks = 5,
+#                   omit = c(10, 15),
+#                   xlimit = c(-10,40),
+#                   ylimit = c(-40,10),
+#                   panel = "",
+#                   group = "4 categories",
+#                   xlabel = expression(paste("Hourly Temperature (", degree, C, ")")),
+#                   ylabel = "Percentage change in visitation",
+#                   linecolor = "#457b9d",
+#                   errorfill = "#a8dadb"
+#   ) + 
+#   geom_ribbon(data = t_coef_summar,aes(x= xmid,ymin = ci.l,ymax = ci.h, fill = "#eea2a4"),alpha = 0.25) +
+#   geom_line(data = t_coef_summar,aes(x = xmid,y = coef*100,colour = "#C75c64"), linewidth=2) +
+#   scale_y_continuous(breaks = seq(-40, 10, by = 10)) +
+#   theme(legend.position = "none")
+  xdsty_winter <- ggplot() +
+    # geom_histogram(aes(x = t,y =after_stat(density)), binwidth = 1, fill = "#4DBBD5FF", color = "#F0FFFF") +
+    # geom_density(aes(x = t,y =after_stat(density)),color = "#4DBBD5FF") +
+    geom_area(data = dt_winter,aes(x = t),stat = "density", fill = "#a8dadb",colour = "#457b9d") +
+    coord_cartesian(xlim=c(-10,40), expand=TRUE)+
+    theme(plot.title = element_text(size=20),
+          axis.title.x = element_text(size=15, angle=0, vjust=1.1),
+          axis.title.y = element_text(size=15, angle=90, vjust=-0),
+          axis.text.y = element_text(size=15),
+          axis.text.x = element_text(size=15),
+          axis.ticks.y = element_line(),
+          panel.grid.major = element_blank(),
+          panel.grid.minor = element_blank(),
+          panel.background = element_blank(),
+          axis.line.x = element_line(),
+          axis.line.y = element_line(),
+          legend.title=element_blank()
+    )
+p.double.summar <- insert_xaxis_grob(t_p_summar, xdsty_summar, position = "bottom")
+p.double.winter <- insert_xaxis_grob(t_p_winter, xdsty_winter, position = "bottom")
+save(p.double.winter,p.double.summar, file = "~/ClimBehav_bj/results/data/processed/pAll.RData")
+# ggsave("~/ClimBehav_bj/results/plots/figure2.pdf",plot = p.double, device = cairo_pdf, width =6, height =5)
+```
+
+Robustness check
+
+```{r}
+# xx = -10:40
+# reg <- NULL
+# t_coef <- NULL
+# model <- NULL
+# # model_2 <- NULL
+# yy <- NULL
+# #用date替换dow
+# dt <- df
+# dt <- within(dt, cutt <- relevel(cutt, ref = "(20,25]"))
+# 
+# reg[[1]] <- felm(log_visit ~
+#                     cutt + tp + wind + rhum + sp + tcc + holidays +aqi +blh        #   covariates |
+#                    |id + hour + month + date
+#                    |0|id,
+#                     data = dt, na.action="na.omit")
+# # summary(t_fe[[x]])
+# t_coef[[1]] <- felmCoeff(reg[[1]],var = "cutt", omit = c(20, 25)) %>%
+#     select(coef, se, star, xmid, range, ci.l, ci.h)
+# 
+# #3℃ bins
+# breaks.tem <- seq(-10 , 40, 3)
+# df <- df %>%
+#   mutate(cuttem =  cut(t, breaks = breaks.tem)) 
+# 
+# dt <- df
+# dt <- within(dt, cuttem <- relevel(cuttem, ref = "(20,23]"))
+# 
+# reg[[2]] <- felm(log_visit ~
+#                     cuttem + tp + wind + rhum + sp + tcc + holidays +aqi +blh        #   covariates |
+#                    |id + hour + month + dow
+#                    |0|id,
+#                     data = dt, na.action="na.omit")
+# # summary(t_fe[[x]])
+# t_coef[[2]] <- felmCoeff(reg[[2]],var = "cuttem",breaks = 3, omit = c(20, 23)) %>%
+#     select(coef, se, star, xmid, range, ci.l, ci.h)
+# 
+# #用Season替换Month
+# df <- season(df)
+# dt <- df
+# dt <- within(dt, cutt <- relevel(cutt, ref = "(20,25]"))
+# 
+# reg[[3]] <- felm(log_visit ~
+#                     cutt + tp + wind + rhum + sp + tcc + holidays +aqi +blh        #   covariates |
+#                    |id + hour + season + dow
+#                    |0|id,
+#                     data = dt, na.action="na.omit")
+# 
+# t_coef[[3]] <- felmCoeff(reg[[3]],var = "cutt", omit = c(20, 25)) %>%
+#     select(coef, se, star, xmid, range, ci.l, ci.h)
+# 
+# for (i in 1:3) {
+#   model[[i]]<-lm(as.numeric(coef) ~  splines::ns(xmid,df=5),t_coef[[i]])
+#   yy[[i]]<-data.frame(xx, coef = sapply(xx,function(x) predict(model[[i]],data.frame(xmid=x))))
+# }
+# 
+# #plot
+# t_p_rob <- t_p +
+#   geom_line(data=yy[[1]], aes(x=xx, y=coef * 100), color="#608595", linewidth=1, alpha=1) +
+#   geom_line(data=yy[[2]], aes(x=xx, y=coef * 100), color="#DFC286", linewidth=1, alpha=1) +
+#   geom_line(data=yy[[3]], aes(x=xx, y=coef * 100), color="#C07A92", linewidth=1, alpha=1) +
+#   geom_vline(xintercept = 35, linetype=2, color='red') + geom_vline(xintercept = 0, linetype=2, color='blue')
+```
