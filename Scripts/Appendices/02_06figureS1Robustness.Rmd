@@ -1,0 +1,98 @@
+---
+title: "figure S1 Robustness Check"
+author: "Chen Yu"
+format: html
+editor: 
+  markdown: 
+    wrap: 7
+---
+
+#Set up packages and environment
+```{r}
+library(tidyverse)
+library(data.table)
+library(ggpubr) # for multiplots and labels,ggarrange function
+library(grid) #自定义常用主题
+library(cowplot) #拼图
+
+load("~/ClimBehav_bj/results/data/processed/pClassRobust.RData")
+
+workLiveLabel <- c("Residential", "Park", "Transport", "Work")
+classColor <- c("Residential" = "#457b9d","Park" = "#84a729","Transport" = "#C75c64","Work" = "#f0b57d")
+classSubColor <- c("Residential" = "#e6f1f3","Park" = "#D3e1ae","Transport" = "#eea2a4","Work" = "#f8e8c1")
+## 第一个位置：新建一个其实进度条
+pb <- txtProgressBar(style=3)
+recycle_list <- c(1:4)
+```
+
+#plot
+```{r}
+t_p <- NULL
+robust_p <- NULL
+
+for (i in recycle_list) {
+  x <- workLiveLabel[i]
+  dt <- t_coef[[i]]
+  t_p[[i]] <- ggplot() +
+      geom_hline(aes(yintercept=0), linetype=2, color='black') +
+      geom_ribbon(data=dt, aes(x=xmid, ymin=ci.l*100, ymax=ci.h*100), fill="gray80", alpha=1) +
+      geom_line(data=dt, aes(x=xmid, y=coef * 100), color=classColor[x], linewidth=0.5, alpha=1) +
+      
+      ylab("Percentage change in visitation") +
+      xlab(expression(paste("Hourly Temperature (", degree, C, ")")))+
+      labs(title = x) +
+      coord_cartesian(xlim=c(-10,40), ylim=c(-50,10), expand=TRUE) +
+      theme(legend.position = "none",
+            title = element_text(size=9, angle=0),
+          axis.title.x = element_text(size=9, angle=0, vjust=1.1),
+          axis.title.y = element_text(size=9, angle=90, vjust=-0),
+          axis.text.y = element_text(size=8, angle=0),
+          axis.text.x = element_text(size=8),
+          legend.text = element_text(size=8),
+          legend.title = element_text(size=9),
+          legend.key.size = unit(7, "mm"),
+          # panel.grid.major = element_blank(),
+          axis.line.x = element_line(),
+          axis.line.y = element_line(),
+          panel.background = element_blank())+
+    scale_y_continuous(breaks = seq(-40, 10, by = 10))
+  #plot Robustness
+
+label <- rbind.data.frame(
+  t_coef[[i]] %>% filter(xmid == min(xmid)) %>% select(coef, xmid), 
+  t_coef_date[[i]] %>% filter(xmid == min(xmid)) %>% select(coef, xmid), 
+  t_coef_season[[i]] %>% filter(xmid == min(xmid)) %>% select(coef, xmid), 
+  t_coef_3bin[[i]] %>% filter(xmid == min(xmid)) %>% select(coef, xmid)
+  )
+label$label = c("(1)", "(2)", "(3)", "(4)")
+  
+robust_p[[i]] <- t_p[[i]] + 
+  geom_line(data=t_coef_date[[i]], aes(x=xmid, y=coef * 100), color="#02263e", linewidth=0.5, alpha=1) +
+  geom_line(data=t_coef_season[[i]], aes(x=xmid, y=coef * 100), color="#8F85C2", linewidth=0.5, alpha=1) +
+  geom_line(data=t_coef_3bin[[i]], aes(x=xmid, y=coef * 100), color="#E49F23", linewidth=0.5, alpha=1) +
+  geom_text(
+    aes(x = xmid, y = coef*100, label = label),
+    size = 9,
+    data = label,
+    size.unit = "pt",
+    hjust = "right",
+    vjust = "center")
+  setTxtProgressBar(pb, i/length(recycle_list))
+}
+
+## 第三个位置关闭进度条
+close(pb)
+```
+#Save
+```{r}
+p <- ggarrange(robust_p[[1]],robust_p[[2]],robust_p[[3]],robust_p[[4]],nrow = 2,ncol = 2)
+
+# cairo_ps(file = "~/ClimBehav_bj/results/plots/figureS1.eps",width = 9,height = 9)
+# pushViewport(viewport(layout = grid.layout(1,1)))
+# print(ggdraw(p), vp = viewport(layout.pos.row = 1,layout.pos.col = 1))
+# dev.off()
+ggsave("~/ClimBehav_bj/results/plots/figureS1.svg",plot = p, device = "svg", width =180, height =180,units = "mm")
+ggsave("~/ClimBehav_bj/results/plots/figureS1.eps",plot = p, device = "eps", width =180, height =180,units = "mm")
+ggsave("~/ClimBehav_bj/results/plots/figureS1.pdf",plot = p, device = "pdf", width =180, height =180,units = "mm")
+```
+
